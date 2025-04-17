@@ -85,3 +85,16 @@ Optional flags:
 ## Implementation
 
 The tool is implemented as a Python class that orchestrates the various tools in a logical sequence. It creates a structured output directory for each target and stores all results in an organized manner.
+
+## Tools Used
+- Passive subdomain discovery: subfinder, assetfinder, amass
+- Active subdomain discovery: ffuf
+- Live domain filtering: httpx
+- Screenshot capture: gowitness
+- Subdomain takeover checks: subzy
+- Endpoint crawling: katana
+- JS analysis: LinkFinder
+- Directory brute forcing: ffuf
+- Parameter discovery: arjun
+- Broken link detection: socialhunter
+- Port scanning: nmap
