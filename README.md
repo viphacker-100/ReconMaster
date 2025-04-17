@@ -29,7 +29,8 @@ I've created a comprehensive installation script that will set up ReconMaster an
 1. Save the script to a file named `install_reconmaster.sh`
 2. Make it executable: `chmod +x install_reconmaster.sh`
 3. Run it with root privileges: `sudo ./install_reconmaster.sh`
-
+                        OR
+5. Run it with root privileges: `sudo bash install_reconmaster.sh`
 The script will guide you through the installation process with colored status messages.
 
 ## After Installation
