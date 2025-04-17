@@ -199,7 +199,7 @@ class ReconMaster:
         
         # Extract JS files
         print("[*] Extracting JavaScript files...")
-        cmd = f"cat {urls_file} | grep '\.js$' > {js_files}"
+        cmd = f"cat {urls_file} | grep '\\.js$' > {js_files}"
         subprocess.run(cmd, shell=True)
         
         # Run LinkFinder on JS files for endpoint discovery
