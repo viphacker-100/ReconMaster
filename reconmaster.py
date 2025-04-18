@@ -5,134 +5,181 @@ import subprocess
 import concurrent.futures
 import json
 import time
+import shutil
 import sys
 import logging
-import shutil
 import requests
-import yaml
-from pathlib import Path
 from datetime import datetime
-from tqdm import tqdm
-from colorama import Fore, Style, init
+from typing import Set, Dict, List, Optional, Any
+from dataclasses import dataclass, field
+from pathlib import Path
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 
-# Initialize colorama
-init(autoreset=True)
+# Initialize rich console for better output
+console = Console()
+
+@dataclass
+class ReconResults:
+    """Data class to store reconnaissance results"""
+    subdomains: Set[str] = field(default_factory=set)
+    live_domains: Set[str] = field(default_factory=set)
+    urls: Set[str] = field(default_factory=set)
+    js_files: Set[str] = field(default_factory=set)
+    endpoints: Set[str] = field(default_factory=set)
+    parameters: Set[str] = field(default_factory=set)
+    tech_stack: Dict[str, List[str]] = field(default_factory=dict)
+    takeovers: List[str] = field(default_factory=list)
+    broken_links: List[str] = field(default_factory=list)
+    vulnerabilities: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
 
 class ReconMaster:
-    def __init__(self, target, output_dir, threads=10, wordlist=None, config_file=None, 
-                 verbose=False, resume=False):
+    def __init__(self, target: str, output_dir: str, threads: int = 10, 
+                 wordlist: Optional[str] = None, verbosity: int = 1):
         self.target = target
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.base_dir = output_dir
         self.output_dir = os.path.join(output_dir, f"{target}_{self.timestamp}")
         self.threads = threads
-        self.verbose = verbose
-        self.resume = resume
-        self.subdomains = set()
-        self.live_domains = set()
-        self.urls = set()
-        self.js_files = set()
-        self.endpoints = set()
-        self.parameters = set()
-        self.tech_stack = {}
-        self.takeovers = []
-        self.broken_links = []
-        self.vulnerabilities = []
-        self.progress = {}
-        self.config = self.load_config(config_file)
+        self.verbosity = verbosity
+        self.results = ReconResults()
         
-        # Set up logging
-        self.setup_logging()
-        
-        # Default wordlist if none specified
-        self.wordlist = wordlist if wordlist else self.config.get('wordlists', {}).get(
-            'subdomains', "/usr/share/seclists/Discovery/DNS/deepmagic.com-prefixes-top50000.txt")
-        
-        # Create output directory structure
-        self.create_dirs()
-        
-        # Load progress file if resuming
-        if self.resume:
-            self.load_progress()
-    
-    def setup_logging(self):
-        """Set up logging configuration"""
-        log_file = os.path.join(self.base_dir, f"{self.target}_reconmaster.log")
-        log_level = logging.DEBUG if self.verbose else logging.INFO
-        
+        # Configure logging
+        log_level = logging.DEBUG if verbosity > 1 else logging.INFO
         logging.basicConfig(
             level=log_level,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler()
+                logging.FileHandler(f"{self.output_dir}_recon.log", mode='w'),
+                logging.StreamHandler() if verbosity > 2 else logging.NullHandler()
             ]
         )
         self.logger = logging.getLogger("ReconMaster")
-        self.logger.info(f"Starting ReconMaster for {self.target}")
-    
-    def load_config(self, config_file):
-        """Load configuration from file or use defaults"""
-        default_config = {
-            'tools': {
-                'subfinder': 'subfinder',
-                'assetfinder': 'assetfinder',
-                'amass': 'amass',
-                'ffuf': 'ffuf',
-                'httpx': 'httpx',
-                'gowitness': 'gowitness',
-                'subzy': 'subzy',
-                'katana': 'katana',
-                'arjun': 'arjun',
-                'nmap': 'nmap',
-                'nuclei': 'nuclei',
-                'linkfinder': '/usr/local/bin/linkfinder.py',
-                'waybackurls': 'waybackurls',
-                'gau': 'gau',
-                'socialhunter': 'socialhunter'
-            },
-            'wordlists': {
-                'subdomains': '/usr/share/seclists/Discovery/DNS/deepmagic.com-prefixes-top50000.txt',
-                'content': '/usr/share/seclists/Discovery/Web-Content/common.txt',
-                'parameters': '/usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt'
-            },
-            'api_keys': {
-                'shodan': '',
-                'censys': '',
-                'securitytrails': '',
-                'virustotal': ''
-            },
-            'settings': {
-                'screenshot_timeout': 30,
-                'max_depth_crawl': 2,
-                'sample_size': 20,
-                'nuclei_severity': 'critical,high,medium',
-                'subdomain_permutations': True,
-                'use_proxy': False,
-                'proxy': 'http://127.0.0.1:8080'
-            }
+
+        # Create wordlists directory
+        wordlist_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wordlists")
+        os.makedirs(wordlist_dir, exist_ok=True)
+        
+        # Download n0kovo subdomains wordlist if not present
+        n0kovo_wordlist = os.path.join(wordlist_dir, "n0kovo_subdomains.txt")
+        if not os.path.exists(n0kovo_wordlist):
+            self.download_wordlist(
+                "https://raw.githubusercontent.com/n0kovo/n0kovo_subdomains/main/n0kovo_subdomains_medium.txt",
+                n0kovo_wordlist
+            )
+        
+        # Default wordlists with fallbacks
+        self.wordlists = {
+            "subdomains": self._find_wordlist(
+                wordlist,
+                [
+                    n0kovo_wordlist,
+                    "./wordlists/subdomains.txt"
+                ]
+            ),
+            "directories": self._find_wordlist(
+                None,
+                [
+                    "/usr/share/wordlists/dirb/common.txt",
+                    "./wordlists/directories.txt"
+                ]
+            )
         }
         
-        if config_file and os.path.exists(config_file):
-            try:
-                with open(config_file, 'r') as f:
-                    user_config = yaml.safe_load(f)
-                
-                # Deep merge user config with default config
-                for category in user_config:
-                    if category in default_config and isinstance(default_config[category], dict):
-                        default_config[category].update(user_config[category])
-                    else:
-                        default_config[category] = user_config[category]
-                        
-                return default_config
-            except Exception as e:
-                print(f"Error loading config file: {e}")
-                return default_config
-        else:
-            return default_config
+        # Check for required tools
+        self.check_requirements()
         
-    def create_dirs(self):
+        # Create output directory structure
+        self.create_dirs()
+    
+    def download_wordlist(self, url: str, output_path: str) -> bool:
+        """Download a wordlist from a URL"""
+        try:
+            console.print(f"[bold yellow]Downloading wordlist from {url}...[/bold yellow]")
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                with open(output_path, 'wb') as f:
+                    f.write(response.content)
+                console.print(f"[green]✓[/green] Wordlist downloaded to {output_path}")
+                return True
+            else:
+                console.print(f"[red]✗[/red] Failed to download wordlist: HTTP {response.status_code}")
+                return False
+        except Exception as e:
+            console.print(f"[red]✗[/red] Error downloading wordlist: {str(e)}")
+            return False
+            
+    def _find_wordlist(self, specified_wordlist: Optional[str], fallbacks: List[str]) -> str:
+        """Find and validate a wordlist path with fallbacks"""
+        if specified_wordlist and os.path.exists(specified_wordlist):
+            return specified_wordlist
+            
+        for fallback in fallbacks:
+            if os.path.exists(fallback):
+                return fallback
+                
+        # Create a minimal default wordlist if nothing is found
+        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wordlists")
+        os.makedirs(default_dir, exist_ok=True)
+        
+        if "subdomains" in fallbacks[0]:
+            default_list = os.path.join(default_dir, "subdomains.txt")
+            if not os.path.exists(default_list):
+                with open(default_list, 'w') as f:
+                    f.write("\n".join(["www", "mail", "dev", "admin", "test", "staging", "prod", 
+                                      "api", "portal", "app", "dashboard", "beta", "store", "shop",
+                                      "secure", "corporate", "internal", "uat", "qa", "vpn"]))
+            return default_list
+        else:
+            default_list = os.path.join(default_dir, "directories.txt")
+            if not os.path.exists(default_list):
+                with open(default_list, 'w') as f:
+                    f.write("\n".join(["admin", "login", "wp-admin", "backup", "api", "dev", "test",
+                                      "dashboard", "portal", "cdn", "static", "assets", "images",
+                                      "uploads", "config", "settings", "users", "auth", "wp-content"]))
+            return default_list
+        
+    def check_requirements(self) -> None:
+        """Check if required tools are installed"""
+        required_tools = {
+            "subfinder": "https://github.com/projectdiscovery/subfinder",
+            "httpx": "https://github.com/projectdiscovery/httpx",
+            "ffuf": "https://github.com/ffuf/ffuf"
+        }
+        
+        optional_tools = {
+            "nuclei": "https://github.com/projectdiscovery/nuclei",
+            "katana": "https://github.com/projectdiscovery/katana",
+            "gowitness": "https://github.com/sensepost/gowitness",
+            "aquatone": "https://github.com/michenriksen/aquatone",
+            "puredns": "https://github.com/d3mondev/puredns"
+        }
+        
+        missing_required = []
+        missing_optional = []
+        
+        for tool, url in required_tools.items():
+            if not shutil.which(tool):
+                missing_required.append(f"{tool} ({url})")
+        
+        for tool, url in optional_tools.items():
+            if not shutil.which(tool):
+                missing_optional.append(f"{tool} ({url})")
+        
+        if missing_required:
+            console.print("\n[bold red]Missing required tools:[/bold red]")
+            for tool in missing_required:
+                console.print(f"- {tool}")
+            console.print("\nPlease install the missing required tools and try again.")
+            sys.exit(1)
+            
+        if missing_optional:
+            console.print("\n[bold yellow]Missing optional tools:[/bold yellow]")
+            for tool in missing_optional:
+                console.print(f"- {tool}")
+            console.print("\nThe tool will work without these, but some functionality will be limited.")
+            
+    def create_dirs(self) -> None:
         """Create directory structure for outputs"""
         dirs = [
             self.output_dir,
@@ -141,492 +188,392 @@ class ReconMaster:
             f"{self.output_dir}/endpoints",
             f"{self.output_dir}/js",
             f"{self.output_dir}/params",
-            f"{self.output_dir}/reports",
-            f"{self.output_dir}/vulnerabilities",
-            f"{self.output_dir}/ports",
-            f"{self.output_dir}/tech",
-            f"{self.output_dir}/archives"
+            f"{self.output_dir}/vulns",
+            f"{self.output_dir}/reports"
         ]
         
         for dir_path in dirs:
             os.makedirs(dir_path, exist_ok=True)
             
-        self.logger.info(f"Created output directory structure at {self.output_dir}")
-    
-    def save_progress(self):
-        """Save current progress to file"""
-        progress_file = os.path.join(self.output_dir, "progress.json")
+        console.print(f"[green]✓[/green] Created output directory structure at [bold]{self.output_dir}[/bold]")
         
-        self.progress = {
-            "target": self.target,
-            "timestamp": self.timestamp,
-            "modules_completed": self.progress,
-            "subdomains_count": len(self.subdomains),
-            "live_domains_count": len(self.live_domains),
-            "urls_count": len(self.urls),
-            "js_files_count": len(self.js_files)
-        }
-        
-        with open(progress_file, 'w') as f:
-            json.dump(self.progress, f)
-        
-        self.logger.debug(f"Progress saved to {progress_file}")
-    
-    def load_progress(self):
-        """Load progress from file if resuming a scan"""
-        # Find the most recent scan directory for this target
-        target_dirs = [d for d in os.listdir(self.base_dir) 
-                      if os.path.isdir(os.path.join(self.base_dir, d)) and d.startswith(f"{self.target}_")]
-        
-        if not target_dirs:
-            self.logger.warning("No previous scan found to resume")
-            return
-        
-        # Sort by timestamp (directory name)
-        latest_dir = sorted(target_dirs)[-1]
-        progress_file = os.path.join(self.base_dir, latest_dir, "progress.json")
-        
-        if os.path.exists(progress_file):
-            try:
-                with open(progress_file, 'r') as f:
-                    self.progress = json.load(f)
-                
-                # Update output directory to the previous scan directory
-                self.output_dir = os.path.join(self.base_dir, latest_dir)
-                self.timestamp = latest_dir.split('_')[-1]
-                
-                # Load saved data
-                self.load_saved_data()
-                
-                self.logger.info(f"Resuming scan from {self.output_dir}")
-            except Exception as e:
-                self.logger.error(f"Error loading progress file: {e}")
-        else:
-            self.logger.warning("No progress file found to resume")
-    
-    def load_saved_data(self):
-        """Load saved data from files when resuming a scan"""
-        # Load subdomains
-        subdomains_file = os.path.join(self.output_dir, "subdomains", "all_subdomains.txt")
-        if os.path.exists(subdomains_file):
-            with open(subdomains_file, 'r') as f:
-                self.subdomains = set([line.strip() for line in f if line.strip()])
-        
-        # Load live domains
-        live_domains_file = os.path.join(self.output_dir, "subdomains", "live_domains.txt")
-        if os.path.exists(live_domains_file):
-            with open(live_domains_file, 'r') as f:
-                self.live_domains = set([line.strip().split(' ')[0] for line in f if line.strip()])
-        
-        # Load URLs
-        urls_file = os.path.join(self.output_dir, "endpoints", "urls.txt")
-        if os.path.exists(urls_file):
-            with open(urls_file, 'r') as f:
-                self.urls = set([line.strip() for line in f if line.strip()])
-        
-        # Load JS files
-        js_files = os.path.join(self.output_dir, "js", "js_files.txt")
-        if os.path.exists(js_files):
-            with open(js_files, 'r') as f:
-                self.js_files = set([line.strip() for line in f if line.strip()])
-    
-    def run_command(self, command, silent=False):
-        """Run a shell command with proper error handling"""
-        if self.verbose and not silent:
+    def run_command(self, command: str, silent: bool = False) -> subprocess.CompletedProcess:
+        """Run a shell command with proper logging and error handling"""
+        if not silent:
             self.logger.debug(f"Running command: {command}")
-        
-        try:
-            if silent:
-                result = subprocess.run(
-                    command, 
-                    shell=True, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-            else:
-                result = subprocess.run(command, shell=True)
             
-            if result.returncode != 0:
-                if silent:
-                    self.logger.error(f"Command failed: {command}")
-                    self.logger.error(f"Error: {result.stderr}")
-                return False
-            return True
+        try:
+            result = subprocess.run(
+                command, 
+                shell=True, 
+                text=True, 
+                capture_output=True
+            )
+            
+            if result.returncode != 0 and not silent:
+                self.logger.warning(f"Command returned non-zero exit code {result.returncode}: {command}")
+                self.logger.debug(f"Error output: {result.stderr}")
+            
+            return result
         except Exception as e:
-            self.logger.error(f"Exception running command: {e}")
-            return False
-    
-    def check_tools(self):
-        """Check if required tools are installed"""
-        self.logger.info("Checking required tools")
-        missing_tools = []
+            self.logger.error(f"Error running command '{command}': {str(e)}")
+            return subprocess.CompletedProcess(args=command, returncode=1, stdout="", stderr=str(e))
         
-        for tool, path in self.config['tools'].items():
-            if not shutil.which(path) and not os.path.isfile(path):
-                missing_tools.append(tool)
-        
-        if missing_tools:
-            self.logger.warning(f"Missing tools: {', '.join(missing_tools)}")
-            self.logger.warning("Some functionality may be limited")
-        else:
-            self.logger.info("All required tools are installed")
+    def passive_subdomain_enum(self) -> Set[str]:
+        """Perform passive subdomain enumeration using multiple tools"""
+        with console.status("[bold green]Starting passive subdomain enumeration...[/bold green]") as status:
+            subdomain_dir = os.path.join(self.output_dir, "subdomains")
+            all_subdomains = os.path.join(subdomain_dir, "all_passive.txt")
             
-        return len(missing_tools) == 0
+            # Run tools in parallel
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True
+            ) as progress:
+                tools = {
+                    "subfinder": f"subfinder -d {self.target} -o {os.path.join(subdomain_dir, 'subfinder.txt')} -silent",
+                    "assetfinder": f"assetfinder --subs-only {self.target} > {os.path.join(subdomain_dir, 'assetfinder.txt')}",
+                    "amass": f"amass enum -passive -d {self.target} -o {os.path.join(subdomain_dir, 'amass.txt')}"
+                }
+                
+                tasks = {}
+                for tool, command in tools.items():
+                    if shutil.which(tool.split()[0]):
+                        task_id = progress.add_task(f"Running {tool}...", total=None)
+                        tasks[tool] = task_id
+                    else:
+                        self.logger.warning(f"{tool} not found, skipping")
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tools), self.threads)) as executor:
+                    futures = {executor.submit(self.run_command, cmd): tool for tool, cmd in tools.items() if shutil.which(tool.split()[0])}
+                    
+                    for future in concurrent.futures.as_completed(futures):
+                        tool = futures[future]
+                        try:
+                            result = future.result()
+                            if result.returncode == 0:
+                                progress.update(tasks[tool], description=f"[green]✓[/green] {tool} completed")
+                            else:
+                                progress.update(tasks[tool], description=f"[red]✗[/red] {tool} failed")
+                        except Exception as e:
+                            progress.update(tasks[tool], description=f"[red]✗[/red] {tool} error: {str(e)}")
+            
+            # Combine results
+            self.run_command(f"cat {subdomain_dir}/*.txt 2>/dev/null | sort -u > {all_subdomains}")
+            
+            # Load subdomains
+            try:
+                with open(all_subdomains, 'r') as f:
+                    self.results.subdomains = set(line.strip() for line in f if line.strip())
+                console.print(f"[green]✓[/green] Found [bold]{len(self.results.subdomains)}[/bold] unique subdomains via passive enumeration")
+            except FileNotFoundError:
+                console.print("[yellow]![/yellow] No subdomains found in passive enumeration")
+                
+        return self.results.subdomains
     
-    def passive_subdomain_enum(self):
-        """Perform passive subdomain enumeration"""
-        if self.progress.get('passive_subdomain_enum', False) and self.resume:
-            self.logger.info("Skipping passive subdomain enumeration (already completed)")
-            return self.subdomains
-        
-        self.logger.info(f"Starting passive subdomain enumeration for {self.target}")
-        
-        # Subfinder
-        subfinder = self.config['tools']['subfinder']
-        subfinder_output = os.path.join(self.output_dir, "subdomains", "subfinder.txt")
-        self.logger.info("Running subfinder...")
-        
-        subfinder_cmd = f"{subfinder} -d {self.target} -o {subfinder_output}"
-        if self.config['api_keys'].get('securitytrails'):
-            subfinder_cmd += f" -provider securitytrails -securitytrails-key {self.config['api_keys']['securitytrails']}"
-        if self.config['api_keys'].get('virustotal'):
-            subfinder_cmd += f" -provider virustotal -virustotal-key {self.config['api_keys']['virustotal']}"
-        
-        self.run_command(subfinder_cmd)
-        
-        # Assetfinder
-        assetfinder = self.config['tools']['assetfinder']
-        assetfinder_output = os.path.join(self.output_dir, "subdomains", "assetfinder.txt")
-        self.logger.info("Running assetfinder...")
-        self.run_command(f"{assetfinder} --subs-only {self.target} > {assetfinder_output}")
-        
-        # Amass passive
-        amass = self.config['tools']['amass']
-        amass_output = os.path.join(self.output_dir, "subdomains", "amass.txt")
-        self.logger.info("Running amass passive...")
-        self.run_command(f"{amass} enum -passive -d {self.target} -o {amass_output}")
-        
-        # Waybackurls for historical subdomains
-        waybackurls = self.config['tools']['waybackurls']
-        wayback_output = os.path.join(self.output_dir, "archives", "wayback.txt")
-        self.logger.info("Fetching URLs from Wayback Machine...")
-        self.run_command(f"echo {self.target} | {waybackurls} > {wayback_output}")
-        
-        # GAU for more URL discovery
-        gau = self.config['tools']['gau']
-        gau_output = os.path.join(self.output_dir, "archives", "gau.txt")
-        self.logger.info("Fetching URLs with GAU...")
-        self.run_command(f"{gau} {self.target} --threads {self.threads} > {gau_output}")
-        
-        # Extract subdomains from wayback and gau results
-        wayback_domains_output = os.path.join(self.output_dir, "subdomains", "wayback_domains.txt")
-        self.run_command(f"cat {wayback_output} {gau_output} | grep -Po '(https?://)?\w+\.{self.target.replace('.','\.')}' | sort -u | sed 's/https\\?:\\/\\///' > {wayback_domains_output}")
-        
-        # Combine results
-        all_subdomains = os.path.join(self.output_dir, "subdomains", "all_passive.txt")
-        self.run_command(f"cat {self.output_dir}/subdomains/*.txt | sort -u > {all_subdomains}")
-        
-        # Load subdomains
-        try:
-            with open(all_subdomains, 'r') as f:
-                self.subdomains = set([line.strip() for line in f if line.strip()])
-            self.logger.info(f"Found {len(self.subdomains)} unique subdomains via passive enumeration")
-        except FileNotFoundError:
-            self.logger.warning("No subdomains found in passive enumeration")
-        
-        # Mark this step as completed
-        self.progress['passive_subdomain_enum'] = True
-        self.save_progress()
-        
-        return self.subdomains
-    
-    def active_subdomain_enum(self):
-        """Perform active subdomain enumeration using brute force"""
-        if self.progress.get('active_subdomain_enum', False) and self.resume:
-            self.logger.info("Skipping active subdomain enumeration (already completed)")
-            return self.subdomains
-        
-        self.logger.info(f"Starting active subdomain enumeration for {self.target}")
-        
-        # Use ffuf for brute forcing subdomains
-        ffuf = self.config['tools']['ffuf']
-        ffuf_output = os.path.join(self.output_dir, "subdomains", "ffuf_brute.json")
-        self.logger.info(f"Running ffuf with wordlist {self.wordlist}...")
-        
-        cmd = f"{ffuf} -u http://FUZZ.{self.target} -w {self.wordlist} -o {ffuf_output} -of json -s"
-        self.run_command(cmd)
-        
-        # Process ffuf results
-        try:
-            with open(ffuf_output, 'r') as f:
-                ffuf_data = json.load(f)
-                for result in ffuf_data.get('results', []):
-                    if 'input' in result and 'FUZZ' in result['input']:
-                        subdomain = f"{result['input']['FUZZ']}.{self.target}"
-                        self.subdomains.add(subdomain)
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            self.logger.error(f"Error processing ffuf results: {e}")
-        
-        # DNS permutation if enabled
-        if self.config['settings'].get('subdomain_permutations', True):
-            self.logger.info("Performing DNS permutation...")
-            # Use dnsgen or similar tool if available
-            if shutil.which('dnsgen'):
-                permutation_list = os.path.join(self.output_dir, "subdomains", "permutations.txt")
-                permutation_output = os.path.join(self.output_dir, "subdomains", "resolved_permutations.txt")
-                
-                with open(os.path.join(self.output_dir, "subdomains", "all_passive.txt"), 'r') as f:
-                    seed_domains = f.read()
-                
-                # Generate permutations
-                self.run_command(f"cat {os.path.join(self.output_dir, 'subdomains', 'all_passive.txt')} | dnsgen - > {permutation_list}")
-                
-                # Resolve permutations
-                self.run_command(f"massdns -r /usr/share/wordlists/resolvers.txt -t A -o S -w {permutation_output} {permutation_list}")
-                
-                # Extract valid subdomains
-                valid_permutations = os.path.join(self.output_dir, "subdomains", "valid_permutations.txt")
-                self.run_command(f"cat {permutation_output} | grep -v NXDOMAIN | cut -d' ' -f1 > {valid_permutations}")
-                
-                # Add to subdomains
-                try:
-                    with open(valid_permutations, 'r') as f:
-                        for line in f:
-                            subdomain = line.strip()
-                            if subdomain.endswith('.'):
-                                subdomain = subdomain[:-1]  # Remove trailing dot
-                            self.subdomains.add(subdomain)
-                except FileNotFoundError:
-                    self.logger.warning("No valid permutations found")
-        
-        # Update all subdomains file
-        all_subdomains = os.path.join(self.output_dir, "subdomains", "all_subdomains.txt")
-        with open(all_subdomains, 'w') as f:
-            for subdomain in sorted(self.subdomains):
-                f.write(f"{subdomain}\n")
-                
-        self.logger.info(f"Total unique subdomains after brute forcing: {len(self.subdomains)}")
-        
-        # Mark this step as completed
-        self.progress['active_subdomain_enum'] = True
-        self.save_progress()
-        
-        return self.subdomains
-    
-    def resolve_live_domains(self):
-        """Resolve live domains using httpx"""
-        if self.progress.get('resolve_live_domains', False) and self.resume:
-            self.logger.info("Skipping live domain resolution (already completed)")
-            return self.live_domains
-        
-        self.logger.info("Resolving live domains with httpx")
-        
-        all_subdomains = os.path.join(self.output_dir, "subdomains", "all_subdomains.txt")
-        live_domains_file = os.path.join(self.output_dir, "subdomains", "live_domains.txt")
-        tech_file = os.path.join(self.output_dir, "tech", "technologies.json")
-        
-        # First ensure we have the combined subdomain list
-        if not os.path.exists(all_subdomains):
-            with open(all_subdomains, 'w') as f:
-                for subdomain in sorted(self.subdomains):
+    def active_subdomain_enum(self) -> Set[str]:
+        """Perform active subdomain enumeration using brute force with n0kovo wordlist"""
+        if not self.results.subdomains:
+            self.passive_subdomain_enum()
+            
+        with console.status("[bold green]Starting active subdomain enumeration with n0kovo wordlist...[/bold green]"):
+            subdomain_dir = os.path.join(self.output_dir, "subdomains")
+            ffuf_output = os.path.join(subdomain_dir, "ffuf_brute.json")
+            
+            # Save existing subdomains to file for later combination
+            passive_subdomains = os.path.join(subdomain_dir, "passive_subdomains.txt")
+            with open(passive_subdomains, 'w') as f:
+                for subdomain in sorted(self.results.subdomains):
                     f.write(f"{subdomain}\n")
-        
-        # Run httpx with enhanced options
-        httpx = self.config['tools']['httpx']
-        cmd = f"{httpx} -l {all_subdomains} -o {live_domains_file} -json -tech-detect -title -status-code -content-length -web-server -ip -cdn -cname -asn -follow-redirects -response-time -no-color"
-        if self.config['settings'].get('use_proxy', False):
-            cmd += f" -proxy {self.config['settings']['proxy']}"
-        
-        self.run_command(cmd)
-        
-        # Process JSON output for tech stack information
-        httpx_json = os.path.join(self.output_dir, "subdomains", "httpx_results.json")
-        cmd = f"{httpx} -l {all_subdomains} -json -o {httpx_json} -tech-detect -title -status-code -content-length -web-server -ip -cdn -cname -asn -follow-redirects -response-time -silent"
-        self.run_command(cmd)
-        
-        # Extract technology information
-        try:
-            with open(httpx_json, 'r') as f:
-                lines = f.readlines()
-                tech_data = {}
+            
+            # Use puredns for DNS resolution if available
+            if shutil.which("puredns"):
+                console.print(f"[bold]Running puredns with {self.wordlists['subdomains']}...[/bold]")
+                puredns_output = os.path.join(subdomain_dir, "puredns_brute.txt")
+                cmd = f"puredns bruteforce {self.wordlists['subdomains']} {self.target} -r /etc/resolv.conf -w {puredns_output}"
+                self.run_command(cmd)
                 
-                for line in lines:
-                    try:
-                        result = json.loads(line)
-                        url = result.get('url', '')
-                        tech_result = {
-                            'url': url,
-                            'status_code': result.get('status_code', ''),
-                            'title': result.get('title', ''),
-                            'webserver': result.get('webserver', ''),
-                            'content_length': result.get('content_length', ''),
-                            'technologies': result.get('technologies', []),
-                            'ip': result.get('host', ''),
-                            'cdn': result.get('cdn', False),
-                            'cname': result.get('cname', []),
-                            'asn': result.get('asn', '')
-                        }
-                        tech_data[url] = tech_result
-                    except json.JSONDecodeError:
-                        continue
-                
-                # Save technology information
-                with open(tech_file, 'w') as tf:
-                    json.dump(tech_data, tf, indent=4)
-                
-                self.logger.info(f"Technology information saved to {tech_file}")
-        except Exception as e:
-            self.logger.error(f"Error processing technology information: {e}")
-        
-        # Load live domains
-        try:
-            with open(live_domains_file, 'r') as f:
-                for line in f:
-                    if line.strip():
-                        domain = line.strip().split(' ')[0]
-                        self.live_domains.add(domain)
-            self.logger.info(f"Found {len(self.live_domains)} live domains")
-        except FileNotFoundError:
-            self.logger.warning("No live domains found")
-        
-        # Mark this step as completed
-        self.progress['resolve_live_domains'] = True
-        self.save_progress()
-        
-        return self.live_domains
-    
-    def take_screenshots(self):
-        """Take screenshots of live domains using gowitness"""
-        if self.progress.get('take_screenshots', False) and self.resume:
-            self.logger.info("Skipping screenshots (already completed)")
-            return
-        
-        self.logger.info("Taking screenshots with gowitness")
-        
-        if not self.live_domains:
-            self.logger.warning("No live domains to screenshot. Run resolve_live_domains first.")
-            return
-        
-        live_domains_file = os.path.join(self.output_dir, "subdomains", "live_domains.txt")
-        screenshots_dir = os.path.join(self.output_dir, "screenshots")
-        
-        # Run gowitness with improved settings
-        gowitness = self.config['tools']['gowitness']
-        timeout = self.config['settings'].get('screenshot_timeout', 30)
-        
-        cmd = f"{gowitness} file -f {live_domains_file} -P {screenshots_dir} --no-http --timeout {timeout} --chrome-timeout {timeout}"
-        self.run_command(cmd)
-        
-        # Generate report
-        report_path = os.path.join(screenshots_dir, "report.html")
-        self.run_command(f"{gowitness} report generate -o {report_path}")
-        
-        self.logger.info(f"Screenshots saved to {screenshots_dir}")
-        self.logger.info(f"Screenshot report available at {report_path}")
-        
-        # Mark this step as completed
-        self.progress['take_screenshots'] = True
-        self.save_progress()
-    
-    def scan_for_takeovers(self):
-        """Scan for subdomain takeovers using subzy"""
-        if self.progress.get('scan_for_takeovers', False) and self.resume:
-            self.logger.info("Skipping subdomain takeover scanning (already completed)")
-            return
-        
-        self.logger.info("Scanning for subdomain takeovers with subzy")
-        
-        all_subdomains = os.path.join(self.output_dir, "subdomains", "all_subdomains.txt")
-        takeovers_file = os.path.join(self.output_dir, "subdomains", "takeovers.txt")
-        
-        # Run subzy with improved settings
-        subzy = self.config['tools']['subzy']
-        cmd = f"{subzy} run --targets {all_subdomains} --output {takeovers_file} --concurrency {self.threads} --verify"
-        self.run_command(cmd)
-        
-        # Check results
-        try:
-            with open(takeovers_file, 'r') as f:
-                self.takeovers = [line.strip() for line in f if line.strip()]
-            if self.takeovers:
-                self.logger.info(f"Found {len(self.takeovers)} potential subdomain takeovers!")
+                if os.path.exists(puredns_output):
+                    with open(puredns_output, 'r') as f:
+                        brute_domains = set(line.strip() for line in f if line.strip())
+                    self.results.subdomains.update(brute_domains)
+                    console.print(f"[green]✓[/green] Found [bold]{len(brute_domains)}[/bold] subdomains via puredns bruteforce")
+            
+            # FFUF as fallback or additional method
             else:
-                self.logger.info("No subdomain takeovers found")
-        except FileNotFoundError:
-            self.logger.info("No subdomain takeovers found")
-        
-        # Mark this step as completed
-        self.progress['scan_for_takeovers'] = True
-        self.save_progress()
+                console.print(f"[bold]Running ffuf with {self.wordlists['subdomains']}...[/bold]")
+                cmd = f"ffuf -u http://FUZZ.{self.target} -w {self.wordlists['subdomains']} -o {ffuf_output} -of json -s"
+                self.run_command(cmd)
+                
+                # Process ffuf results
+                try:
+                    with open(ffuf_output, 'r') as f:
+                        ffuf_data = json.load(f)
+                        for result in ffuf_data.get('results', []):
+                            if 'input' in result and 'FUZZ' in result['input']:
+                                subdomain = f"{result['input']['FUZZ']}.{self.target}"
+                                self.results.subdomains.add(subdomain)
+                except (FileNotFoundError, json.JSONDecodeError) as e:
+                    self.logger.warning(f"Error processing ffuf results: {e}")
+            
+            # Update all subdomains file
+            all_subdomains = os.path.join(subdomain_dir, "all_subdomains.txt")
+            with open(all_subdomains, 'w') as f:
+                for subdomain in sorted(self.results.subdomains):
+                    f.write(f"{subdomain}\n")
+                    
+            console.print(f"[green]✓[/green] Total unique subdomains after brute forcing: [bold]{len(self.results.subdomains)}[/bold]")
+            
+        return self.results.subdomains
     
-    def crawl_endpoints(self):
-        """Crawl endpoints using katana and other tools"""
-        if self.progress.get('crawl_endpoints', False) and self.resume:
-            self.logger.info("Skipping endpoint crawling (already completed)")
+    def resolve_live_domains(self) -> Set[str]:
+        """Resolve live domains using httpx"""
+        if not self.results.subdomains:
+            self.passive_subdomain_enum()
+            
+        with console.status("[bold green]Resolving live domains with httpx...[/bold green]"):
+            subdomain_dir = os.path.join(self.output_dir, "subdomains")
+            all_subdomains = os.path.join(subdomain_dir, "all_subdomains.txt")
+            live_domains_file = os.path.join(subdomain_dir, "live_domains.txt")
+            httpx_json = os.path.join(subdomain_dir, "httpx_results.json")
+            
+            # First ensure we have the combined subdomain list
+            if not os.path.exists(all_subdomains):
+                with open(all_subdomains, 'w') as f:
+                    for subdomain in sorted(self.results.subdomains):
+                        f.write(f"{subdomain}\n")
+            
+            # Run httpx with expanded capabilities
+            cmd = (f"httpx -l {all_subdomains} -o {live_domains_file} -json {httpx_json} "
+                   f"-status-code -title -tech-detect -favicon -follow-redirects -random-agent "
+                   f"-timeout 10 -retries 2 -threads {self.threads}")
+            self.run_command(cmd)
+            
+            # Load live domains
+            try:
+                with open(live_domains_file, 'r') as f:
+                    self.results.live_domains = set(line.strip().split(' ')[0] for line in f if line.strip())
+                
+                # Load technology stack information
+                if os.path.exists(httpx_json):
+                    with open(httpx_json, 'r') as f:
+                        for line in f:
+                            try:
+                                data = json.loads(line)
+                                if 'technologies' in data and data['technologies']:
+                                    self.results.tech_stack[data['url']] = data['technologies']
+                            except json.JSONDecodeError:
+                                continue
+                
+                console.print(f"[green]✓[/green] Found [bold]{len(self.results.live_domains)}[/bold] live domains")
+            except FileNotFoundError:
+                console.print("[yellow]![/yellow] No live domains found")
+                
+        return self.results.live_domains
+    
+    def take_screenshots(self) -> None:
+        """Take screenshots of live domains"""
+        if not self.results.live_domains:
+            console.print("[yellow]![/yellow] No live domains to screenshot. Run resolve_live_domains first.")
             return
         
-        self.logger.info("Crawling endpoints with katana")
+        with console.status("[bold green]Taking screenshots...[/bold green]"):
+            live_domains_file = os.path.join(self.output_dir, "subdomains", "live_domains.txt")
+            screenshots_dir = os.path.join(self.output_dir, "screenshots")
+            
+            # Use aquatone or gowitness depending on availability
+            if shutil.which("aquatone"):
+                cmd = f"cat {live_domains_file} | aquatone -out {screenshots_dir}"
+                self.run_command(cmd)
+                console.print(f"[green]✓[/green] Screenshots saved to {screenshots_dir} with aquatone")
+            elif shutil.which("gowitness"):
+                cmd = f"gowitness file -f {live_domains_file} -P {screenshots_dir} --no-http"
+                self.run_command(cmd)
+                console.print(f"[green]✓[/green] Screenshots saved to {screenshots_dir} with gowitness")
+            else:
+                console.print("[yellow]![/yellow] Neither aquatone nor gowitness found for taking screenshots")
+    
+    def scan_for_takeovers(self) -> List[str]:
+        """Scan for subdomain takeovers"""
+        if not self.results.subdomains:
+            console.print("[yellow]![/yellow] No subdomains found. Run passive_subdomain_enum first.")
+            return []
         
-        if not self.live_domains:
-            self.logger.warning("No live domains for crawling. Run resolve_live_domains first.")
-            return
+        with console.status("[bold green]Scanning for subdomain takeovers...[/bold green]"):
+            subdomain_dir = os.path.join(self.output_dir, "subdomains")
+            all_subdomains = os.path.join(subdomain_dir, "all_subdomains.txt")
+            takeover_tools = []
+            
+            # Check available tools and run them
+            if shutil.which("nuclei"):
+                takeover_file = os.path.join(subdomain_dir, "nuclei_takeovers.txt")
+                cmd = f"nuclei -l {all_subdomains} -t takeovers/ -o {takeover_file} -silent"
+                takeover_tools.append(("nuclei", takeover_file, cmd))
+            
+            if shutil.which("subzy"):
+                takeover_file = os.path.join(subdomain_dir, "subzy_takeovers.txt")
+                cmd = f"subzy run --targets {all_subdomains} --output {takeover_file}"
+                takeover_tools.append(("subzy", takeover_file, cmd))
+                
+            if not takeover_tools:
+                console.print("[yellow]![/yellow] No subdomain takeover tools found (nuclei/subzy)")
+                return []
+                
+            # Run tools in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(takeover_tools)) as executor:
+                futures = {executor.submit(self.run_command, cmd): (tool, output_file) for tool, output_file, cmd in takeover_tools}
+                
+                for future in concurrent.futures.as_completed(futures):
+                    tool, output_file = futures[future]
+                    try:
+                        result = future.result()
+                        console.print(f"[green]✓[/green] Completed {tool} scan")
+                    except Exception as e:
+                        console.print(f"[red]✗[/red] Error running {tool}: {str(e)}")
+            
+            # Combine results
+            combined_takeovers = os.path.join(subdomain_dir, "takeovers.txt")
+            takeover_files = " ".join(output_file for _, output_file, _ in takeover_tools)
+            self.run_command(f"cat {takeover_files} 2>/dev/null | sort -u > {combined_takeovers}")
+            
+            # Load results
+            try:
+                with open(combined_takeovers, 'r') as f:
+                    self.results.takeovers = [line.strip() for line in f if line.strip()]
+                
+                if self.results.takeovers:
+                    console.print(f"[bold red]⚠[/bold red] Found [bold]{len(self.results.takeovers)}[/bold] potential subdomain takeovers!")
+                else:
+                    console.print("[green]✓[/green] No subdomain takeovers found")
+            except FileNotFoundError:
+                console.print("[green]✓[/green] No subdomain takeovers found")
+                
+        return self.results.takeovers
+    
+    def crawl_endpoints(self) -> Set[str]:
+        """Crawl endpoints using modern tools"""
+        if not self.results.live_domains:
+            console.print("[yellow]![/yellow] No live domains for crawling. Run resolve_live_domains first.")
+            return set()
         
-        live_domains_file = os.path.join(self.output_dir, "subdomains", "live_domains.txt")
-        urls_file = os.path.join(self.output_dir, "endpoints", "urls.txt")
-        js_files = os.path.join(self.output_dir, "js", "js_files.txt")
-        
-        # Run katana to discover URLs with improved settings
-        katana = self.config['tools']['katana']
-        max_depth = self.config['settings'].get('max_depth_crawl', 2)
-        
-        self.logger.info("Running katana for URL discovery...")
-        cmd = f"{katana} -list {live_domains_file} -jc -o {urls_file} -d {max_depth} -concurrency {self.threads*2} -timeout 20 -rate-limit 10"
-        self.run_command(cmd)
-        
-        # Extract JS files
-        self.logger.info("Extracting JavaScript files...")
-        self.run_command(f"cat {urls_file} | grep '\\.js$' | grep -v '\\?\\|#' > {js_files}")
-        
-        # Run LinkFinder on JS files for endpoint discovery
-        linkfinder = self.config['tools']['linkfinder']
-        if os.path.exists(linkfinder):
-            self.logger.info("Running LinkFinder on JS files...")
+        with console.status("[bold green]Crawling endpoints...[/bold green]"):
+            live_domains_file = os.path.join(self.output_dir, "subdomains", "live_domains.txt")
+            urls_file = os.path.join(self.output_dir, "endpoints", "urls.txt")
+            js_files = os.path.join(self.output_dir, "js", "js_files.txt")
+            
+            # Use katana if available
+            if shutil.which("katana"):
+                console.print("[bold]Running katana for URL discovery...[/bold]")
+                cmd = f"katana -list {live_domains_file} -jc -o {urls_file} -threads {self.threads}"
+                self.run_command(cmd)
+            # Use gospider as fallback
+            elif shutil.which("gospider"):
+                console.print("[bold]Running gospider for URL discovery...[/bold]")
+                cmd = f"gospider -S {live_domains_file} -o {self.output_dir}/endpoints/gospider -c {self.threads} -d 3"
+                self.run_command(cmd)
+                # Combine gospider results
+                self.run_command(f"find {self.output_dir}/endpoints/gospider -type f -exec cat {{}} \\; | grep -Eo '(http|https)://[^[:space:]]+' | sort -u > {urls_file}")
+            else:
+                console.print("[yellow]![/yellow] No web crawling tools found (katana/gospider)")
+                return set()
+            
+            # Extract JS files
+            self.run_command(f"cat {urls_file} 2>/dev/null | grep -i '\\.js$' | sort -u > {js_files}")
+            
+            # Process JS files for endpoint discovery
             endpoints_file = os.path.join(self.output_dir, "endpoints", "js_endpoints.txt")
             
-            # Process JS files in batches to avoid command line length issues
-            with open(js_files, 'r') as f:
-                js_list = [line.strip() for line in f if line.strip()]
-            
-            if js_list:
-                # Process in batches of 20
-                batch_size = 20
-                total_batches = (len(js_list) + batch_size - 1) // batch_size
+            # Use different JS analysis tools based on availability
+            if shutil.which("gau"):
+                console.print("[bold]Running gau for additional URL discovery...[/bold]")
+                gau_file = os.path.join(self.output_dir, "endpoints", "gau_urls.txt")
+                with open(live_domains_file, 'r') as f:
+                    domains = [line.strip().split(' ')[0] for line in f if line.strip()]
+                    # Take at most 10 domains to avoid excessive time
+                    sample_domains = domains[:10] if len(domains) > 10 else domains
                 
-                for i in range(0, len(js_list), batch_size):
-                    batch = js_list[i:i+batch_size]
-                    batch_file = os.path.join(self.output_dir, "js", f"batch_{i//batch_size}.txt")
+                for domain in sample_domains:
+                    domain = domain.replace("http://", "").replace("https://", "").split('/')[0]
+                    cmd = f"gau --threads {self.threads} {domain} >> {gau_file}"
+                    self.run_command(cmd)
+                
+                # Combine with other URLs
+                self.run_command(f"cat {gau_file} {urls_file} 2>/dev/null | sort -u > {urls_file}.tmp && mv {urls_file}.tmp {urls_file}")
+            
+            # Extract endpoints from JS files
+            if os.path.exists(js_files) and os.path.getsize(js_files) > 0:
+                if shutil.which("LinkFinder") or os.path.exists("/path/to/LinkFinder/linkfinder.py"):
+                    linkfinder_path = shutil.which("LinkFinder") or "/path/to/LinkFinder/linkfinder.py"
+                    console.print("[bold]Extracting endpoints from JS files with LinkFinder...[/bold]")
+                    cmd = f"cat {js_files} | while read url; do python3 {linkfinder_path} -i \"$url\" -o cli >> {endpoints_file}; done"
+                    self.run_command(cmd)
+            
+            # Load results
+            try:
+                with open(urls_file, 'r') as f:
+                    self.results.urls = set(line.strip() for line in f if line.strip())
+                
+                if os.path.exists(js_files):
+                    with open(js_files, 'r') as f:
+                        self.results.js_files = set(line.strip() for line in f if line.strip())
+                        
+                if os.path.exists(endpoints_file):        
+                    with open(endpoints_file, 'r') as f:
+                        self.results.endpoints = set(line.strip() for line in f if line.strip())
+                        
+                console.print(f"[green]✓[/green] Discovered [bold]{len(self.results.urls)}[/bold] URLs and [bold]{len(self.results.js_files)}[/bold] JavaScript files")
+                
+                if self.results.endpoints:
+                    console.print(f"[green]✓[/green] Extracted [bold]{len(self.results.endpoints)}[/bold] endpoints from JavaScript")
+            except FileNotFoundError:
+                console.print("[yellow]![/yellow] Issue loading crawled endpoints")
+                
+        return self.results.urls
+    
+    def directory_bruteforce(self) -> None:
+        """Brute force directories using ffuf or dirsearch"""
+        if not self.results.live_domains:
+            console.print("[yellow]![/yellow] No live domains for directory brute forcing. Run resolve_live_domains first.")
+            return
+        
+        # Using a smaller list of domains for dir bruteforcing to avoid excessive time
+        sample_domains = list(self.results.live_domains)[:5] if len(self.results.live_domains) > 5 else list(self.results.live_domains)
+        
+        with console.status(f"[bold green]Brute forcing directories for {len(sample_domains)} domains...[/bold green]"):
+            # Use ffuf or dirsearch based on availability
+            if shutil.which("ffuf"):
+                for domain in sample_domains:
+                    output_file = os.path.join(
+                        self.output_dir, 
+                        "endpoints", 
+                        f"{domain.replace('://', '_').replace('.', '_').replace('/', '_')}_dirs.json"
+                    )
+                    self.logger.info(f"Brute forcing directories for {domain}...")
                     
-                    with open(batch_file, 'w') as bf:
-                        for js_url in batch:
-                            bf.write(f"{js_url}\n")
+                    cmd = f"ffuf -u {domain}/FUZZ -w {self.wordlists['directories']} -mc 200,204,301,302,307,401,403 -o {output_file} -of json -s"
+                    self.run_command(cmd)
+            elif shutil.which("dirsearch"):
+                for domain in sample_domains:
+                    output_file = os.path.join(
+                        self.output_dir, 
+                        "endpoints", 
+                        f"{domain.replace('://', '_').replace('.', '_').replace('/', '_')}_dirs.txt"
+                    )
+                    self.logger.info(f"Brute forcing directories for {domain}...")
                     
-                    self.logger.info(f"Processing batch {(i//batch_size)+1}/{total_batches} of JS files...")
-                    cmd = f"cat {batch_file} | parallel -j{self.threads} 'python3 {linkfinder} -i {{}} -o cli >> {endpoints_file} 2>/dev/null'"
+                    cmd = f"dirsearch -u {domain} -w {self.wordlists['directories']} -o {output_file} --format=plain -q"
                     self.run_command(cmd)
             else:
-                self.logger.info("No JavaScript files found to analyze")
-        else:
-            self.logger.warning(f"LinkFinder not found at {linkfinder}. Skipping JS endpoint discovery.")
-        
-        # Process Wayback and GAU data for endpoints
-        wayback_output = os.path.join(self.output_dir, "archives", "wayback.txt")
-        gau_output = os.path.join(self.output_dir, "archives", "gau.txt")
-        archive_endpoints = os.path.join(self.output_dir, "endpoints", "archive_endpoints.txt")
-        
-        if os.path.exists(wayback_output) and os.path.exists(gau_output):
-            self.logger.info("Processing archive data for endpoints...")
-            cmd = f"cat {wayback_output} {gau_output} | sort -u > {archive_endpoints}"
-            self.run_command(cmd)
-        
-        # Combine
+                console.print("[yellow]![/yellow] No directory brute force tools found (ffuf/dirsearch)")
+                return
+                
+            console.print("[green]✓[/green] Directory brute forcing completed")
+    
+    def find_parameters(self) -> Set[str]:
+        """Find parameters using various tools"""
+        endpoints_file = os.path.join(self.output_dir, "endpoints", "urls.txt")
+        if
