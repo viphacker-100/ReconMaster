@@ -112,14 +112,6 @@ wget https://raw.githubusercontent.com/n0kovo/n0kovo_subdomains/main/n0kovo_subd
 wget https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/directory-list-2.3-medium.txt -O ~/tools/wordlists/n0kovo_subdomains/fuzz/directory-list.txt
 ```
 
-6. Clone and set up LinkFinder:
-```bash
-git clone https://github.com/GerbenJavado/LinkFinder.git
-cd LinkFinder
-pip install -r requirements.txt
-python setup.py install
-```
-
 ## Usage
 
 ### Basic Usage
