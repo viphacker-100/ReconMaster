@@ -88,6 +88,8 @@ pip install -r requirements.txt
 
 3. Install required Go tools:
 ```bash
+sudo apt install gccgo-go 
+sudo apt install golang-go
 go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 go install -v github.com/tomnomnom/assetfinder@latest
 go install -v github.com/OWASP/Amass/v3/...@latest
