@@ -125,7 +125,9 @@ python setup.py install
 ```bash
 reconmaster -d target.com
 ```
-          OR
+
+###            OR
+
 ```python3 reconmaster.py -d target.com -o ./recon_results```          
 
 ### Advanced Options
@@ -133,8 +135,10 @@ reconmaster -d target.com
 ```bash
 reconmaster -d target.com -o ./custom_output -t 30 -w custom_wordlist.txt
 ```
-                           OR                   
-```bash
+
+ ###             OR     
+              
+```
 python3 reconmaster.py -d target.com -o ./custom_output -t 30 -w custom_wordlist.txt
 ```
 ### Full Command Reference
