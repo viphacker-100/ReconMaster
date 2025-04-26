@@ -5,148 +5,52 @@ import subprocess
 import concurrent.futures
 import json
 import time
+import asyncio
+import aiohttp
 import logging
-import sys
 from datetime import datetime
-from pathlib import Path
-from typing import List, Set, Dict, Optional
-from tqdm import tqdm
-import yaml
-import requests
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.table import Table
-from rich.panel import Panel
+from functools import lru_cache
+import signal
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('reconmaster.log'),
-        logging.StreamHandler()
-    ]
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-
-console = Console()
-
-class Config:
-    def __init__(self):
-        self.config_file = Path.home() / '.reconmaster' / 'config.yaml'
-        self.config = self._load_config()
-        
-    def _load_config(self) -> dict:
-        """Load configuration from YAML file"""
-        if not self.config_file.exists():
-            return self._create_default_config()
-            
-        try:
-            with open(self.config_file, 'r') as f:
-                return yaml.safe_load(f)
-        except Exception as e:
-            logging.error(f"Error loading config: {e}")
-            return self._create_default_config()
-            
-    def _create_default_config(self) -> dict:
-        """Create default configuration"""
-        default_config = {
-            'api_keys': {
-                'shodan': '',
-                'virustotal': '',
-                'securitytrails': '',
-                'censys': ''
-            },
-            'tools': {
-                'subfinder': '/usr/local/bin/subfinder',
-                'assetfinder': '/usr/local/bin/assetfinder',
-                'amass': '/usr/local/bin/amass',
-                'httpx': '/usr/local/bin/httpx',
-                'nmap': '/usr/bin/nmap',
-                'ffuf': '/usr/local/bin/ffuf',
-                'gowitness': '/usr/local/bin/gowitness',
-                'katana': '/usr/local/bin/katana',
-                'arjun': '/usr/local/bin/arjun'
-            },
-            'wordlists': {
-                'subdomains': '/usr/share/wordlists/subdomains.txt',
-                'directories': '/usr/share/wordlists/directory-list.txt',
-                'parameters': '/usr/share/wordlists/parameter-names.txt'
-            },
-            'proxy': {
-                'enabled': False,
-                'http': '',
-                'https': ''
-            },
-            'threads': 10,
-            'timeout': 30
-        }
-        
-        # Create config directory if it doesn't exist
-        self.config_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Save default config
-        with open(self.config_file, 'w') as f:
-            yaml.dump(default_config, f)
-            
-        return default_config
-        
-    def get_api_key(self, service: str) -> str:
-        """Get API key for a service"""
-        return self.config['api_keys'].get(service, '')
-        
-    def get_tool_path(self, tool: str) -> str:
-        """Get path for a tool"""
-        return self.config['tools'].get(tool, '')
-        
-    def get_wordlist(self, type: str) -> str:
-        """Get path for a wordlist"""
-        return self.config['wordlists'].get(type, '')
-        
-    def get_proxy(self) -> dict:
-        """Get proxy configuration"""
-        return self.config['proxy']
-        
-    def get_threads(self) -> int:
-        """Get number of threads"""
-        return self.config['threads']
-        
-    def get_timeout(self) -> int:
-        """Get timeout value"""
-        return self.config['timeout']
+logger = logging.getLogger("ReconMaster")
 
 class ReconMaster:
-    def __init__(self, target: str, output_dir: str, threads: int = 10, wordlist: Optional[str] = None):
+    def __init__(self, target, output_dir, threads=20, wordlist=None, timeout=30):
         self.target = target
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.base_dir = output_dir
         self.output_dir = os.path.join(output_dir, f"{target}_{self.timestamp}")
-        self.config = Config()
-        self.threads = threads or self.config.get_threads()
-        self.subdomains: Set[str] = set()
-        self.live_domains: Set[str] = set()
-        self.urls: Set[str] = set()
-        self.js_files: Set[str] = set()
-        self.endpoints: Set[str] = set()
-        self.parameters: Set[str] = set()
-        self.tech_stack: Dict[str, List[str]] = {}
-        self.takeovers: List[str] = []
-        self.broken_links: List[str] = []
-        self.vulnerabilities: List[Dict] = []
-        self.ports: Dict[str, List[int]] = {}
-        self.services: Dict[str, Dict] = {}
+        self.threads = threads
+        self.timeout = timeout
+        self.subdomains = set()
+        self.live_domains = set()
+        self.urls = set()
+        self.js_files = set()
+        self.endpoints = set()
+        self.parameters = set()
+        self.tech_stack = {}
+        self.takeovers = []
+        self.broken_links = []
+        self.rate_limiter = asyncio.Semaphore(10)  # Limit concurrent requests
         
-        # Use provided wordlist or default from config
-        self.wordlist = wordlist if wordlist else self.config.get_wordlist('subdomains')
+        # Default wordlist
+        self.wordlist = wordlist if wordlist else "/path/to/n0kovo_subdomains/n0kovo_subdomains.txt"
         
         # Create output directory structure
         self.create_dirs()
         
-        # Setup proxy if enabled
-        self.proxy = self.config.get_proxy()
-        if self.proxy['enabled']:
-            os.environ['HTTP_PROXY'] = self.proxy['http']
-            os.environ['HTTPS_PROXY'] = self.proxy['https']
-            
+        # Set timeout handler
+        signal.signal(signal.SIGALRM, self._timeout_handler)
+        
+    def _timeout_handler(self, signum, frame):
+        raise TimeoutError("Operation timed out")
+        
     def create_dirs(self):
         """Create directory structure for outputs"""
         dirs = [
@@ -156,125 +60,166 @@ class ReconMaster:
             f"{self.output_dir}/endpoints",
             f"{self.output_dir}/js",
             f"{self.output_dir}/params",
-            f"{self.output_dir}/reports",
-            f"{self.output_dir}/vulnerabilities",
-            f"{self.output_dir}/tech_stack",
-            f"{self.output_dir}/ports"
+            f"{self.output_dir}/reports"
         ]
         
-        for dir_path in dirs:
-            os.makedirs(dir_path, exist_ok=True)
-            
-        console.print(f"[green][+] Created output directory structure at {self.output_dir}[/green]")
+        os.makedirs(self.output_dir, exist_ok=True)
         
-    def run_command(self, command: str, description: str = "") -> bool:
-        """Run a command with progress tracking"""
+        # Create directories in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(dirs)) as executor:
+            executor.map(lambda d: os.makedirs(d, exist_ok=True), dirs)
+            
+        logger.info(f"Created output directory structure at {self.output_dir}")
+    
+    async def _run_cmd_async(self, cmd, timeout=None):
+        """Run command asynchronously with timeout"""
         try:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                console=console
-            ) as progress:
-                task = progress.add_task(description, total=100)
-                
-                process = subprocess.Popen(
-                    command,
-                    shell=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                
-                while True:
-                    output = process.stdout.readline()
-                    if output == '' and process.poll() is not None:
-                        break
-                    if output:
-                        progress.update(task, advance=1)
-                        
-                return_code = process.poll()
-                if return_code != 0:
-                    error = process.stderr.read()
-                    console.print(f"[red][!] Error running command: {error}[/red]")
-                    return False
-                return True
+            timeout = timeout or self.timeout
+            process =   await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            try:
+                stdout, stderr =   await asyncio.wait_for(process.communicate(), timeout)
+                return stdout.decode().strip(), stderr.decode().strip(), process.returncode
+            except asyncio.TimeoutError:
+                process.kill()
+                logger.warning(f"Command timed out after {timeout}s: {cmd}")
+                return "", f"Timeout after {timeout}s", 1
                 
         except Exception as e:
-            console.print(f"[red][!] Exception running command: {e}[/red]")
-            return False
-            
-    def passive_subdomain_enum(self):
-        """Perform passive subdomain enumeration with improved tools"""
-        console.print(f"\n[cyan][+] Starting passive subdomain enumeration for {self.target}[/cyan]")
+            logger.error(f"Command execution error: {e}")
+            return "", str(e), 1
+    
+    def _run_cmd(self, cmd, timeout=None):
+        """Run synchronous command with timeout"""
+        try:
+            timeout = timeout or self.timeout
+            return subprocess.run(
+                cmd, 
+                shell=True, 
+                capture_output=True, 
+                text=True, 
+                timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Command timed out after {timeout}s: {cmd}")
+            return None
+        except Exception as e:
+            logger.error(f"Command execution error: {e}")
+            return None
+    
+    async def passive_subdomain_enum(self):
+        """Perform passive subdomain enumeration concurrently"""
+        logger.info(f"Starting passive subdomain enumeration for {self.target}")
         
-        tools = {
-            'subfinder': f"{self.config.get_tool_path('subfinder')} -d {self.target} -o {self.output_dir}/subdomains/subfinder.txt",
-            'assetfinder': f"{self.config.get_tool_path('assetfinder')} --subs-only {self.target} > {self.output_dir}/subdomains/assetfinder.txt",
-            'amass': f"{self.config.get_tool_path('amass')} enum -passive -d {self.target} -o {self.output_dir}/subdomains/amass.txt"
-        }
+        subfinder_output = os.path.join(self.output_dir, "subdomains", "subfinder.txt")
+        assetfinder_output = os.path.join(self.output_dir, "subdomains", "assetfinder.txt") 
+        amass_output = os.path.join(self.output_dir, "subdomains", "amass.txt")
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = []
-            for tool, cmd in tools.items():
-                futures.append(executor.submit(self.run_command, cmd, f"Running {tool}..."))
-                
-            for future in concurrent.futures.as_completed(futures):
-                if not future.result():
-                    console.print("[yellow][!] Some tools failed during passive enumeration[/yellow]")
-                    
-        # Combine results
+        # Run tools concurrently
+        tasks = [
+            self._run_cmd_async(f"subfinder -d {self.target} -o {subfinder_output} -silent"),
+            self._run_cmd_async(f"assetfinder --subs-only {self.target} > {assetfinder_output}"),
+            self._run_cmd_async(f"amass enum -passive -d {self.target} -o {amass_output}", timeout=300)  # Longer timeout for amass
+        ]
+        
+        await asyncio.gather(*tasks)
+        
+        # Combine results efficiently
         all_subdomains = os.path.join(self.output_dir, "subdomains", "all_passive.txt")
-        subprocess.run(f"cat {self.output_dir}/subdomains/*.txt | sort -u > {all_subdomains}", shell=True)
+        await self._run_cmd_async(f"cat {self.output_dir}/subdomains/*.txt 2>/dev/null | sort -u > {all_subdomains}")
         
         # Load subdomains
         try:
             with open(all_subdomains, 'r') as f:
-                self.subdomains = set([line.strip() for line in f])
-            console.print(f"[green][+] Found {len(self.subdomains)} unique subdomains via passive enumeration[/green]")
+                self.subdomains = set([line.strip() for line in f if line.strip()])
+            logger.info(f"Found {len(self.subdomains)} unique subdomains via passive enumeration")
         except FileNotFoundError:
-            console.print("[red][!] No subdomains found in passive enumeration[/red]")
+            logger.warning("No subdomains found in passive enumeration")
             
         return self.subdomains
     
-    def active_subdomain_enum(self):
-        """Perform active subdomain enumeration using brute force with improved tools"""
-        console.print(f"\n[cyan][+] Starting active subdomain enumeration for {self.target}[/cyan]")
+    async def active_subdomain_enum(self):
+        """Perform active subdomain enumeration using brute force with optimized chunks"""
+        logger.info(f"Starting active subdomain enumeration for {self.target}")
         
-        # Use ffuf for brute forcing subdomains
-        ffuf_output = os.path.join(self.output_dir, "subdomains", "ffuf_brute.json")
-        console.print(f"[*] Running ffuf with wordlist {self.wordlist}...")
+        # Split wordlist into chunks for parallel processing
+        chunk_size = 5000
+        ffuf_output_dir = os.path.join(self.output_dir, "subdomains", "ffuf_chunks")
+        os.makedirs(ffuf_output_dir, exist_ok=True)
         
-        cmd = f"{self.config.get_tool_path('ffuf')} -u http://FUZZ.{self.target} -w {self.wordlist} -o {ffuf_output} -of json -s"
-        if not self.run_command(cmd, "Brute forcing subdomains..."):
-            console.print("[red][!] Failed to run ffuf[/red]")
-            return self.subdomains
-        
-        # Process ffuf results
-        try:
-            with open(ffuf_output, 'r') as f:
-                ffuf_data = json.load(f)
-                for result in ffuf_data.get('results', []):
-                    if 'input' in result and 'FUZZ' in result['input']:
-                        subdomain = f"{result['input']['FUZZ']}.{self.target}"
-                        self.subdomains.add(subdomain)
-                        
-            # Update all subdomains file
-            all_subdomains = os.path.join(self.output_dir, "subdomains", "all_subdomains.txt")
-            with open(all_subdomains, 'w') as f:
-                for subdomain in sorted(self.subdomains):
-                    f.write(f"{subdomain}\n")
-                    
-            console.print(f"[green][+] Total unique subdomains after brute forcing: {len(self.subdomains)}[/green]")
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            console.print(f"[red][!] Error processing ffuf results: {e}[/red]")
+        # Get wordlist line count
+        wc_cmd = f"wc -l {self.wordlist}"
+        wc_result = self._run_cmd(wc_cmd)
+        if wc_result and wc_result.returncode == 0:
+            try:
+                total_lines = int(wc_result.stdout.strip().split()[0])
+                chunks = (total_lines // chunk_size) + 1
+            except (ValueError, IndexError):
+                chunks = 10  # Default to 10 chunks if wc fails
+        else:
+            chunks = 10
             
+        logger.info(f"Splitting wordlist into {chunks} chunks for parallel processing")
+        
+        # Create temporary wordlist chunks
+        chunk_files = []
+        for i in range(chunks):
+            chunk_file = f"{ffuf_output_dir}/chunk_{i}.txt"
+            start = i * chunk_size + 1
+            end = (i + 1) * chunk_size
+            
+            # Use sed to extract chunk
+            chunk_cmd = f"sed -n '{start},{end}p' {self.wordlist} > {chunk_file}"
+            await self._run_cmd_async(chunk_cmd)
+            chunk_files.append(chunk_file)
+        
+        # Run ffuf on each chunk concurrently
+        async def process_chunk(chunk_file, chunk_num):
+            output_file = f"{ffuf_output_dir}/ffuf_chunk_{chunk_num}.json"
+            cmd = f"ffuf -u http://FUZZ.{self.target} -w {chunk_file} -o {output_file} -of json -s -t 50 -rate 100"
+            await self._run_cmd_async(cmd, timeout=300)  # 5 minutes per chunk
+            return output_file
+        
+        # Process chunks in parallel
+        tasks = [process_chunk(chunk_file, i) for i, chunk_file in enumerate(chunk_files)]
+        chunk_outputs =   await asyncio.gather(*tasks)
+        
+        # Process results
+        new_subdomains = set()
+        for output_file in chunk_outputs:
+            try:
+                with open(output_file, 'r') as f:
+                    ffuf_data = json.load(f)
+                    for result in ffuf_data.get('results', []):
+                        if 'input' in result and 'FUZZ' in result['input']:
+                            subdomain = f"{result['input']['FUZZ']}.{self.target}"
+                            new_subdomains.add(subdomain)
+            except (FileNotFoundError, json.JSONDecodeError) as e:
+                logger.error(f"Error processing ffuf results from {output_file}: {e}")
+        
+        # Update subdomains
+        self.subdomains.update(new_subdomains)
+        
+        # Update all subdomains file
+        all_subdomains = os.path.join(self.output_dir, "subdomains", "all_subdomains.txt")
+        with open(all_subdomains, 'w') as f:
+            for subdomain in sorted(self.subdomains):
+                f.write(f"{subdomain}\n")
+                
+        logger.info(f"Total unique subdomains after brute forcing: {len(self.subdomains)}")
+        
+        # Clean up chunk files
+        await self._run_cmd_async(f"rm -f {ffuf_output_dir}/chunk_*.txt")
+        
         return self.subdomains
     
-    def resolve_live_domains(self):
-        """Resolve live domains using httpx with improved functionality"""
-        console.print("\n[cyan][+] Resolving live domains with httpx[/cyan]")
+    async def resolve_live_domains(self):
+        """Resolve live domains using httpx with optimized settings"""
+        logger.info("Resolving live domains with httpx")
         
         all_subdomains = os.path.join(self.output_dir, "subdomains", "all_subdomains.txt")
         live_domains_file = os.path.join(self.output_dir, "subdomains", "live_domains.txt")
@@ -285,319 +230,452 @@ class ReconMaster:
                 for subdomain in sorted(self.subdomains):
                     f.write(f"{subdomain}\n")
         
-        # Run httpx with additional options
-        cmd = (
-            f"{self.config.get_tool_path('httpx')} -l {all_subdomains} "
-            f"-o {live_domains_file} -status-code -title -tech-detect "
-            f"-follow-redirects -silent -timeout {self.config.get_timeout()} "
-            f"-threads {self.threads}"
-        )
+        # Run httpx with optimized settings
+        cmd = f"httpx -l {all_subdomains} -o {live_domains_file} -status-code -title -tech-detect -follow-redirects -silent -rate-limit 150 -threads {self.threads} -timeout 10"
+        await self._run_cmd_async(cmd, timeout=600)  # 10 minutes timeout
         
-        if not self.run_command(cmd, "Resolving live domains..."):
-            console.print("[red][!] Failed to run httpx[/red]")
-            return self.live_domains
-        
-        # Load live domains and tech stack
+        # Load live domains
         try:
             with open(live_domains_file, 'r') as f:
                 for line in f:
                     if line.strip():
-                        parts = line.strip().split(' ')
-                        domain = parts[0]
+                        domain = line.strip().split(' ')[0]
                         self.live_domains.add(domain)
                         
-                        # Extract tech stack if available
-                        if len(parts) > 2:
-                            tech = parts[2:]
-                            self.tech_stack[domain] = tech
-                            
-            console.print(f"[green][+] Found {len(self.live_domains)} live domains[/green]")
+                        # Extract tech stack info if available
+                        parts = line.strip().split(' ')
+                        for part in parts:
+                            if part.startswith('[') and part.endswith(']'):
+                                tech = part[1:-1]
+                                if domain not in self.tech_stack:
+                                    self.tech_stack[domain] = []
+                                self.tech_stack[domain].append(tech)
             
-            # Save tech stack information
-            tech_stack_file = os.path.join(self.output_dir, "tech_stack", "tech_stack.json")
-            with open(tech_stack_file, 'w') as f:
-                json.dump(self.tech_stack, f, indent=2)
-                
+            logger.info(f"Found {len(self.live_domains)} live domains")
         except FileNotFoundError:
-            console.print("[red][!] No live domains found[/red]")
+            logger.warning("No live domains found")
             
         return self.live_domains
     
-    def take_screenshots(self):
-        """Take screenshots of live domains using gowitness with improved functionality"""
-        console.print("\n[cyan][+] Taking screenshots with gowitness[/cyan]")
+    async def take_screenshots(self):
+        """Take screenshots of live domains using gowitness with concurrency"""
+        logger.info("Taking screenshots with gowitness")
         
         if not self.live_domains:
-            console.print("[yellow][!] No live domains to screenshot. Run resolve_live_domains first.[/yellow]")
+            logger.warning("No live domains to screenshot. Run resolve_live_domains first.")
             return
         
         live_domains_file = os.path.join(self.output_dir, "subdomains", "live_domains.txt")
         screenshots_dir = os.path.join(self.output_dir, "screenshots")
         
-        # Run gowitness with additional options
-        cmd = (
-            f"{self.config.get_tool_path('gowitness')} file -f {live_domains_file} "
-            f"-P {screenshots_dir} --no-http --threads {self.threads} "
-            f"--timeout {self.config.get_timeout()}"
-        )
+        # Split domains into chunks for parallel processing
+        with open(live_domains_file, 'r') as f:
+            domains = [line.strip().split(' ')[0] for line in f if line.strip()]
         
-        if not self.run_command(cmd, "Taking screenshots..."):
-            console.print("[red][!] Failed to run gowitness[/red]")
+        if not domains:
+            logger.warning("No domains found in live domains file")
             return
             
-        console.print(f"[green][+] Screenshots saved to {screenshots_dir}[/green]")
+        # Determine chunk size based on number of domains
+        chunk_size = max(5, min(50, len(domains) // (self.threads // 2)))
+        chunks = [domains[i:i + chunk_size] for i in range(0, len(domains), chunk_size)]
+        
+        # Process each chunk with gowitness
+        async def process_chunk(chunk, chunk_id):
+            chunk_file = os.path.join(self.output_dir, f"chunk_{chunk_id}.txt")
+            with open(chunk_file, 'w') as f:
+                for domain in chunk:
+                    f.write(f"{domain}\n")
+            
+            # Run gowitness on chunk
+            cmd = f"gowitness file -f {chunk_file} -P {screenshots_dir} --no-http --timeout 20"
+            await self._run_cmd_async(cmd, timeout=300)
+            
+            # Clean up chunk file
+            os.remove(chunk_file)
+        
+        # Process chunks concurrently
+        tasks = [process_chunk(chunk, i) for i, chunk in enumerate(chunks)]
+        await asyncio.gather(*tasks)
+        
+        logger.info(f"Screenshots saved to {screenshots_dir}")
     
-    def scan_for_takeovers(self):
-        """Scan for subdomain takeovers using subzy with improved functionality"""
-        console.print("\n[cyan][+] Scanning for subdomain takeovers with subzy[/cyan]")
+    async def scan_for_takeovers(self):
+        """Scan for subdomain takeovers using subzy with optimized settings"""
+        logger.info("Scanning for subdomain takeovers with subzy")
         
         all_subdomains = os.path.join(self.output_dir, "subdomains", "all_subdomains.txt")
         takeovers_file = os.path.join(self.output_dir, "subdomains", "takeovers.txt")
         
-        # Run subzy with additional options
-        cmd = (
-            f"subzy run --targets {all_subdomains} --output {takeovers_file} "
-            f"--threads {self.threads} --timeout {self.config.get_timeout()}"
-        )
-        
-        if not self.run_command(cmd, "Scanning for takeovers..."):
-            console.print("[red][!] Failed to run subzy[/red]")
-            return
+        # Run subzy with concurrency
+        cmd = f"subzy run --targets {all_subdomains} --output {takeovers_file} --concurrency {self.threads} --timeout 30"
+        await self._run_cmd_async(cmd, timeout=600)  # 10 minutes timeout
         
         # Check results
         try:
             with open(takeovers_file, 'r') as f:
                 self.takeovers = [line.strip() for line in f if line.strip()]
             if self.takeovers:
-                console.print(f"[yellow][+] Found {len(self.takeovers)} potential subdomain takeovers![/yellow]")
-                for takeover in self.takeovers:
-                    console.print(f"[yellow]  - {takeover}[/yellow]")
+                logger.info(f"Found {len(self.takeovers)} potential subdomain takeovers!")
             else:
-                console.print("[green][+] No subdomain takeovers found[/green]")
+                logger.info("No subdomain takeovers found")
         except FileNotFoundError:
-            console.print("[red][!] No takeover results found[/red]")
+            logger.info("No subdomain takeovers found")
     
-    def crawl_endpoints(self):
-        """Crawl endpoints using katana with improved functionality"""
-        console.print("\n[cyan][+] Crawling endpoints with katana[/cyan]")
+    async def crawl_endpoints(self):
+        """Crawl endpoints using katana with optimized settings"""
+        logger.info("Crawling endpoints with katana")
         
         if not self.live_domains:
-            console.print("[yellow][!] No live domains for crawling. Run resolve_live_domains first.[/yellow]")
+            logger.warning("No live domains for crawling. Run resolve_live_domains first.")
             return
         
         live_domains_file = os.path.join(self.output_dir, "subdomains", "live_domains.txt")
         urls_file = os.path.join(self.output_dir, "endpoints", "urls.txt")
         js_files = os.path.join(self.output_dir, "js", "js_files.txt")
         
-        # Run katana with additional options
-        cmd = (
-            f"{self.config.get_tool_path('katana')} -list {live_domains_file} "
-            f"-jc -o {urls_file} -silent -timeout {self.config.get_timeout()} "
-            f"-threads {self.threads}"
-        )
+        # Run optimized katana
+        cmd = f"katana -list {live_domains_file} -jc -silent -concurrency {self.threads} -timeout 20 -rate-limit 100 -o {urls_file}"
+        await self._run_cmd_async(cmd, timeout=1200)  # 20 minutes timeout
         
-        if not self.run_command(cmd, "Crawling endpoints..."):
-            console.print("[red][!] Failed to run katana[/red]")
-            return
+        # Extract JS files efficiently
+        await self._run_cmd_async(f"grep -E '\\.js([?#]|$)' {urls_file} > {js_files}")
         
-        # Extract JS files
-        console.print("[*] Extracting JavaScript files...")
-        cmd = f"cat {urls_file} | grep '\.js$' > {js_files}"
-        subprocess.run(cmd, shell=True)
-        
-        # Run LinkFinder on JS files for endpoint discovery
-        console.print("[*] Running LinkFinder on JS files...")
+        # Process JS files in batches
         endpoints_file = os.path.join(self.output_dir, "endpoints", "js_endpoints.txt")
         
-        # Process JS files in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = []
-            with open(js_files, 'r') as f:
-                for url in f:
-                    url = url.strip()
-                    if url:
-                        cmd = f"python3 /path/to/LinkFinder/linkfinder.py -i \"{url}\" -o cli >> {endpoints_file}"
-                        futures.append(executor.submit(self.run_command, cmd, f"Analyzing {url}..."))
-                        
-            for future in concurrent.futures.as_completed(futures):
-                if not future.result():
-                    console.print("[yellow][!] Some JS files failed to analyze[/yellow]")
-        
-        # Load results
+        # Efficient JS file processing with batched approach
         try:
-            with open(urls_file, 'r') as f:
-                self.urls = set([line.strip() for line in f])
             with open(js_files, 'r') as f:
-                self.js_files = set([line.strip() for line in f])
-            console.print(f"[green][+] Discovered {len(self.urls)} URLs and {len(self.js_files)} JavaScript files[/green]")
-        except FileNotFoundError:
-            console.print("[red][!] Issue loading crawled endpoints[/red]")
+                js_urls = [line.strip() for line in f if line.strip()]
+                
+            if not js_urls:
+                logger.info("No JavaScript files found")
+                return
+                
+            logger.info(f"Processing {len(js_urls)} JavaScript files for endpoints")
+            
+            # Process in smaller batches
+            batch_size = min(50, max(10, len(js_urls) // 10))
+            batches = [js_urls[i:i + batch_size] for i in range(0, len(js_urls), batch_size)]
+            
+            async def process_js_batch(batch):
+                batch_results = []
+                for url in batch:
+                    async with self.rate_limiter:
+                        cmd = f"python3 /path/to/LinkFinder/linkfinder.py -i \"{url}\" -o cli"
+                        stdout, stderr, _ =   await self._run_cmd_async(cmd, timeout=30)
+                        if stdout:
+                            batch_results.append(stdout)
+                return batch_results
+            
+            # Process batches concurrently but with rate limiting
+            tasks = [process_js_batch(batch) for batch in batches]
+            batch_results =   await asyncio.gather(*tasks)
+            
+            # Combine and write results
+            with open(endpoints_file, 'w') as f:
+                for batch_result in batch_results:
+                    for result in batch_result:
+                        f.write(f"{result}\n")
+            
+            # Load data into memory
+            with open(urls_file, 'r') as f:
+                self.urls = set([line.strip() for line in f if line.strip()])
+            self.js_files = set(js_urls)
+            
+            logger.info(f"Discovered {len(self.urls)} URLs and {len(self.js_files)} JavaScript files")
+        except Exception as e:
+            logger.error(f"Error processing JavaScript files: {e}")
     
-    def directory_bruteforce(self):
-        """Brute force directories using ffuf with improved functionality"""
-        console.print("\n[cyan][+] Brute forcing directories with ffuf[/cyan]")
+    async def directory_bruteforce(self):
+        """Brute force directories using ffuf with optimized approach"""
+        logger.info("Brute forcing directories with ffuf")
         
         if not self.live_domains:
-            console.print("[yellow][!] No live domains for directory brute forcing. Run resolve_live_domains first.[/yellow]")
+            logger.warning("No live domains for directory brute forcing. Run resolve_live_domains first.")
             return
         
-        # Using a smaller list of domains for dir bruteforcing to avoid excessive time
-        sample_domains = list(self.live_domains)[:5] if len(self.live_domains) > 5 else list(self.live_domains)
+        # Sample domains intelligently - prioritize with interesting tech stacks
+        sample_domains = []
         
-        wordlist = self.config.get_wordlist('directories')
+        # First add domains with tech stacks of interest
+        interesting_techs = ["wordpress", "joomla", "drupal", "php", "tomcat", "jenkins"]
+        for domain, techs in self.tech_stack.items():
+            if any(tech.lower() in interesting_techs for tech in techs):
+                sample_domains.append(domain)
+                
+        # Then add other domains up to a maximum
+        remaining_slots = min(10, self.threads // 2)
+        other_domains = [d for d in self.live_domains if d not in sample_domains]
+        sample_domains.extend(other_domains[:remaining_slots])
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = []
-            for domain in sample_domains:
-                output_file = os.path.join(self.output_dir, "endpoints", f"{domain.replace('://', '_').replace('.', '_')}_dirs.json")
-                console.print(f"[*] Brute forcing directories for {domain}...")
-                
-                cmd = (
-                    f"{self.config.get_tool_path('ffuf')} -u {domain}/FUZZ -w {wordlist} "
-                    f"-mc 200,204,301,302,307,401,403 -o {output_file} -of json -s "
-                    f"-timeout {self.config.get_timeout()}"
-                )
-                
-                futures.append(executor.submit(self.run_command, cmd, f"Brute forcing {domain}..."))
-                
-            for future in concurrent.futures.as_completed(futures):
-                if not future.result():
-                    console.print("[yellow][!] Some domains failed during directory brute forcing[/yellow]")
-                    
-        console.print("[green][+] Directory brute forcing completed[/green]")
+        # Deduplicate and limit
+        sample_domains = list(set(sample_domains))[:10]
+        
+        if not sample_domains:
+            logger.warning("No domains selected for directory brute forcing")
+            return
+            
+        logger.info(f"Selected {len(sample_domains)} domains for directory brute forcing")
+        
+        # Using a more efficient wordlist
+        wordlist = "/path/to/n0kovo_subdomains/fuzz/directory-list.txt"
+        
+        # Process domains concurrently
+        async def brute_domain(domain):
+            output_file = os.path.join(
+                self.output_dir, 
+                "endpoints", 
+                f"{domain.replace('://', '_').replace('.', '_').replace('/', '_')}_dirs.json"
+            )
+            
+            cmd = (f"ffuf -u {domain}/FUZZ -w {wordlist} -mc 200,204,301,302,307,401,403 "
+                   f"-o {output_file} -of json -s -t 40 -rate 100 -c")
+            await self._run_cmd_async(cmd, timeout=300)  # 5 minutes per domain
+            
+            # Return interesting paths
+            try:
+                with open(output_file, 'r') as f:
+                    data = json.load(f)
+                    return [(domain, result.get('url', ''), result.get('status', 0)) 
+                            for result in data.get('results', [])]
+            except (FileNotFoundError, json.JSONDecodeError):
+                return []
+        
+        # Run brute force tasks
+        tasks = [brute_domain(domain) for domain in sample_domains]
+        results =   await asyncio.gather(*tasks)
+        
+        # Flatten and process interesting findings
+        interesting_dirs = []
+        for domain_results in results:
+            for domain, url, status in domain_results:
+                if status in (200, 401, 403):  # Interesting status codes
+                    interesting_dirs.append((domain, url, status))
+        
+        # Save interesting directories
+        if interesting_dirs:
+            interesting_dirs_file = os.path.join(self.output_dir, "endpoints", "interesting_dirs.txt")
+            with open(interesting_dirs_file, 'w') as f:
+                for domain, url, status in interesting_dirs:
+                    f.write(f"{status} - {url}\n")
+            
+            logger.info(f"Found {len(interesting_dirs)} interesting directories")
+        else:
+            logger.info("No interesting directories found")
     
-    def find_parameters(self):
-        """Find parameters using Arjun with improved functionality"""
-        console.print("\n[cyan][+] Finding parameters with Arjun[/cyan]")
+    async def find_parameters(self):
+        """Find parameters using Arjun with optimized settings"""
+        logger.info("Finding parameters with Arjun")
         
         endpoints_file = os.path.join(self.output_dir, "endpoints", "urls.txt")
         if not os.path.exists(endpoints_file):
-            console.print("[yellow][!] No endpoints found for parameter discovery. Run crawl_endpoints first.[/yellow]")
+            logger.warning("No endpoints found for parameter discovery. Run crawl_endpoints first.")
             return
-        
-        # Sample a few URLs to avoid excessive time
-        with open(endpoints_file, 'r') as f:
-            urls = [line.strip() for line in f][:20]  # Limit to 20 URLs
         
         params_file = os.path.join(self.output_dir, "params", "parameters.txt")
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = []
-            for url in urls:
-                console.print(f"[*] Finding parameters for {url}...")
-                cmd = (
-                    f"{self.config.get_tool_path('arjun')} -u {url} -oT {params_file} "
-                    f"--passive -t {self.threads} --timeout {self.config.get_timeout()}"
-                )
-                futures.append(executor.submit(self.run_command, cmd, f"Analyzing {url}..."))
-                
-            for future in concurrent.futures.as_completed(futures):
-                if not future.result():
-                    console.print("[yellow][!] Some URLs failed during parameter discovery[/yellow]")
+        # Filter interesting URLs for parameter discovery
+        # Look for specific patterns that likely accept parameters
+        filtered_urls_file = os.path.join(self.output_dir, "endpoints", "param_candidate_urls.txt")
         
-        console.print("[green][+] Parameter finding completed[/green]")
+        # Use grep to filter promising URLs
+        filter_cmd = (
+            f"grep -E '\\.(php|aspx|jsp|do|cgi|pl|py)([?#]|$)|"
+            f"(search|query|find|login|register|admin|dashboard|api|get|list|view)' "
+            f"{endpoints_file} > {filtered_urls_file}"
+        )
+        await self._run_cmd_async(filter_cmd)
+        
+        # Sample filtered URLs
+        try:
+            with open(filtered_urls_file, 'r') as f:
+                urls = [line.strip() for line in f if line.strip()]
+                
+            if not urls:
+                logger.warning("No suitable URLs found for parameter discovery")
+                return
+                
+            # Limit to a reasonable number, prioritizing URLs with query indicators
+            urls.sort(key=lambda u: '?' in u or '=' in u, reverse=True)
+            sample_urls = urls[:min(30, len(urls))]
+            
+            logger.info(f"Selected {len(sample_urls)} URLs for parameter discovery")
+            
+            # Process URLs concurrently with rate limiting
+            async def find_params(url):
+                temp_file = os.path.join(self.output_dir, "params", f"params_{hash(url) % 10000}.txt")
+                cmd = f"arjun -u {url} -oT {temp_file} --passive -t 5 --silent"
+                async with self.rate_limiter:
+                      await self._run_cmd_async(cmd, timeout=60)
+                return temp_file
+            
+            # Run in parallel with limit
+            tasks = [find_params(url) for url in sample_urls]
+            param_files =   await asyncio.gather(*tasks)
+            
+            # Combine results
+            await self._run_cmd_async(f"cat {' '.join(param_files)} | sort -u > {params_file}")
+            
+            # Clean up temp files
+            for temp_file in param_files:
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+            
+            # Count parameters
+            with open(params_file, 'r') as f:
+                param_count = sum(1 for _ in f)
+            logger.info(f"Found {param_count} unique parameters")
+            
+        except Exception as e:
+            logger.error(f"Error during parameter discovery: {e}")
     
-    def check_broken_links(self):
-        """Check for broken link hijacking opportunities with improved functionality"""
-        console.print("\n[cyan][+] Checking for broken links[/cyan]")
+    async def check_broken_links(self):
+        """Check for broken link hijacking opportunities with optimization"""
+        logger.info("Checking for broken links")
         
         if not self.live_domains:
-            console.print("[yellow][!] No live domains for broken link checking. Run resolve_live_domains first.[/yellow]")
+            logger.warning("No live domains for broken link checking. Run resolve_live_domains first.")
             return
         
-        live_domains_file = os.path.join(self.output_dir, "subdomains", "live_domains.txt")
+        # Select a subset of domains to avoid excessive time
+        sample_size = min(20, len(self.live_domains))
+        sample_domains = list(self.live_domains)[:sample_size]
+        
+        sample_domains_file = os.path.join(self.output_dir, "subdomains", "sample_live_domains.txt")
+        with open(sample_domains_file, 'w') as f:
+            for domain in sample_domains:
+                f.write(f"{domain}\n")
+        
         broken_links_file = os.path.join(self.output_dir, "reports", "broken_links.txt")
         
-        # Run socialhunter with additional options
-        cmd = (
-            f"socialhunter -l {live_domains_file} -o {broken_links_file} "
-            f"--threads {self.threads} --timeout {self.config.get_timeout()}"
-        )
+        # Custom link checking with concurrency and rate limiting
+        urls_to_check = []
         
-        if not self.run_command(cmd, "Checking for broken links..."):
-            console.print("[red][!] Failed to run socialhunter[/red]")
-            return
+        # First crawl for external links
+        for domain in sample_domains:
+            cmd = f"curl -s -L {domain} | grep -o 'href=\"[^\"]*\"' | grep -v '^#' | grep -v '^javascript:' | sed 's/href=\"//g' | sed 's/\"$//g'"
+            stdout, _, _ =   await self._run_cmd_async(cmd, timeout=30)
+            if stdout:
+                for line in stdout.split('\n'):
+                    if line.startswith('http') and self.target not in line:
+                        urls_to_check.append(line)
         
-        # Check results
-        try:
-            with open(broken_links_file, 'r') as f:
-                self.broken_links = [line.strip() for line in f if line.strip()]
-            if self.broken_links:
-                console.print(f"[yellow][+] Found {len(self.broken_links)} potential broken links[/yellow]")
-                for link in self.broken_links[:10]:  # Show first 10 broken links
-                    console.print(f"[yellow]  - {link}[/yellow]")
-                if len(self.broken_links) > 10:
-                    console.print(f"[yellow]  - ... and {len(self.broken_links) - 10} more[/yellow]")
-            else:
-                console.print("[green][+] No broken links found[/green]")
-        except FileNotFoundError:
-            console.print("[red][!] No broken link results found[/red]")
+        # Check each link
+        broken_links = []
+        
+        async def check_url(url):
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with self.rate_limiter:
+                        async with session.head(url, allow_redirects=True, timeout=10) as response:
+                            if response.status >= 400:
+                                return url, response.status
+                except Exception:
+                    return url, 0  # Connection error
+                return None
+        
+        # Process in batches
+        batch_size = 50
+        for i in range(0, len(urls_to_check), batch_size):
+            batch = urls_to_check[i:i+batch_size]
+            tasks = [check_url(url) for url in batch]
+            results =   await asyncio.gather(*tasks)
+            
+            # Filter and add broken links
+            for result in results:
+                if result is not None:
+                    url, status = result
+                    broken_links.append(f"{status} - {url}")
+        
+        # Save results
+        with open(broken_links_file, 'w') as f:
+            for link in broken_links:
+                f.write(f"{link}\n")
+        
+        self.broken_links = broken_links
+        logger.info(f"Found {len(self.broken_links)} potential broken links")
     
-    def port_scan(self):
-        """Scan ports using nmap with improved functionality"""
-        console.print("\n[cyan][+] Scanning ports with nmap[/cyan]")
+    async def port_scan(self):
+        """Scan ports using nmap with optimization"""
+        logger.info("Scanning ports with nmap")
         
         if not self.live_domains:
-            console.print("[yellow][!] No live domains for port scanning. Run resolve_live_domains first.[/yellow]")
+            logger.warning("No live domains for port scanning. Run resolve_live_domains first.")
             return
         
-        # Sample domains for port scanning to avoid excessive time
-        sample_domains = list(self.live_domains)[:5] if len(self.live_domains) > 5 else list(self.live_domains)
+        # Sample domains more intelligently
+        # Select domains from different IP ranges for better coverage
+        ips = set()
+        selected_domains = []
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = []
-            for domain in sample_domains:
-                # Extract host from URL
-                host = domain.split("://")[1].split("/")[0]
-                output_file = os.path.join(self.output_dir, "ports", f"{host}_nmap.txt")
-                console.print(f"[*] Scanning ports for {host}...")
-                
-                cmd = (
-                    f"{self.config.get_tool_path('nmap')} -p- -T4 -sC -sV {host} "
-                    f"-o {output_file} --min-rate 1000 --max-retries 2"
-                )
-                
-                futures.append(executor.submit(self.run_command, cmd, f"Scanning {host}..."))
-                
-            for future in concurrent.futures.as_completed(futures):
-                if not future.result():
-                    console.print("[yellow][!] Some hosts failed during port scanning[/yellow]")
-        
-        # Process nmap results
-        for domain in sample_domains:
-            host = domain.split("://")[1].split("/")[0]
-            output_file = os.path.join(self.output_dir, "ports", f"{host}_nmap.txt")
-            
+        # First get IPs for all domains
+        cmd = "dig +short "
+        for domain in self.live_domains:
+            # Extract hostname
             try:
-                with open(output_file, 'r') as f:
-                    content = f.read()
-                    # Extract open ports
-                    ports = []
-                    for line in content.split('\n'):
-                        if '/tcp' in line and 'open' in line:
-                            port = int(line.split('/')[0])
-                            ports.append(port)
-                    self.ports[host] = ports
+                host = domain.split("://")[1].split("/")[0]
+                dig_cmd = f"{cmd} {host}"
+                stdout, _, _ =   await self._run_cmd_async(dig_cmd, timeout=5)
+                
+                if stdout:
+                    ip = stdout.split('\n')[0]
+                    ip_prefix = '.'.join(ip.split('.')[:2])  # Use first two octets as prefix
                     
-                    # Extract services
-                    services = {}
-                    for line in content.split('\n'):
-                        if '/tcp' in line and 'open' in line:
-                            parts = line.split()
-                            port = int(parts[0].split('/')[0])
-                            service = parts[2] if len(parts) > 2 else 'unknown'
-                            version = ' '.join(parts[3:]) if len(parts) > 3 else ''
-                            services[port] = {'service': service, 'version': version}
-                    self.services[host] = services
-                    
-            except FileNotFoundError:
-                console.print(f"[red][!] No nmap results found for {host}[/red]")
+                    if ip_prefix not in ips:
+                        ips.add(ip_prefix)
+                        selected_domains.append((host, ip))
+                        
+                        # Limit to reasonable number
+                        if len(selected_domains) >= 8:
+                            break
+            except Exception:
+                continue
         
-        console.print("[green][+] Port scanning completed[/green]")
+        # If we couldn't get enough domains by IP diversity, add more
+        if len(selected_domains) < 5:
+            for domain in self.live_domains:
+                try:
+                    host = domain.split("://")[1].split("/")[0]
+                    if not any(host == d[0] for d in selected_domains):
+                        selected_domains.append((host, ""))
+                        if len(selected_domains) >= 5:
+                            break
+                except:
+                    continue
+        
+        logger.info(f"Selected {len(selected_domains)} diverse hosts for port scanning")
+        
+        # Process domains concurrently
+        async def scan_host(host_info):
+            host, ip = host_info
+            output_file = os.path.join(self.output_dir, "reports", f"{host.replace('.', '_')}_nmap.txt")
+            
+            # Optimize nmap scan: first do a quick scan of common ports
+            quick_cmd = f"nmap -T4 -F -oN {output_file}.quick {host}"
+            await self._run_cmd_async(quick_cmd, timeout=1200)
+            
+            # Then do a more thorough scan of top ports
+            full_cmd = f"nmap -p- -T4 --top-ports 1000 -oN {output_file} {host}"
+            await self._run_cmd_async(full_cmd, timeout=3000)
+            
+            # Combine results
+            await self._run_cmd_async(f"cat {output_file}.quick >> {output_file} && rm {output_file}.quick")
+            
+            return output_file
+        
+        # Run scans with limit
+        tasks = [scan_host(host_info) for host_info in selected_domains]
+        await asyncio.gather(*tasks)
+        
+        logger.info("Port scanning completed")
     
-    def generate_report(self):
-        """Generate a comprehensive report with improved formatting"""
-        console.print("\n[cyan][+] Generating comprehensive report[/cyan]")
+    async def generate_report(self):
+        """Generate a comprehensive report"""
+        print("\n[+] Generating comprehensive report")
         
         report_file = os.path.join(self.output_dir, "reports", "summary_report.md")
         
@@ -630,122 +708,49 @@ class ReconMaster:
                     f.write(f"- ... and {len(self.broken_links) - 20} more\n")
                 f.write("\n")
             
-            # Add tech stack information
-            if self.tech_stack:
-                f.write("## Technology Stack\n\n")
-                for domain, tech in self.tech_stack.items():
-                    f.write(f"### {domain}\n")
-                    for t in tech:
-                        f.write(f"- {t}\n")
-                    f.write("\n")
-            
-            # Add port scan results
-            if self.ports:
-                f.write("## Port Scan Results\n\n")
-                for host, ports in self.ports.items():
-                    f.write(f"### {host}\n")
-                    f.write("#### Open Ports\n")
-                    for port in ports:
-                        service = self.services[host].get(port, {})
-                        service_name = service.get('service', 'unknown')
-                        version = service.get('version', '')
-                        f.write(f"- {port}/tcp - {service_name} {version}\n")
-                    f.write("\n")
-            
             f.write("## Next Steps\n\n")
             f.write("1. Review subdomain takeover opportunities\n")
             f.write("2. Test discovered endpoints for vulnerabilities\n")
             f.write("3. Analyze JavaScript files for sensitive information\n")
             f.write("4. Test parameters for injection vulnerabilities\n")
             f.write("5. Check broken links for potential hijacking\n")
-            f.write("6. Investigate open ports and services\n")
-            f.write("7. Review technology stack for known vulnerabilities\n")
             
-        console.print(f"[green][+] Report generated: {report_file}[/green]")
-        
-        # Display summary in console
-        table = Table(title="Reconnaissance Summary")
-        table.add_column("Category", style="cyan")
-        table.add_column("Count", style="green")
-        
-        table.add_row("Subdomains", str(len(self.subdomains)))
-        table.add_row("Live Domains", str(len(self.live_domains)))
-        table.add_row("Takeovers", str(len(self.takeovers)))
-        table.add_row("URLs", str(len(self.urls)))
-        table.add_row("JS Files", str(len(self.js_files)))
-        table.add_row("Broken Links", str(len(self.broken_links)))
-        
-        console.print(table)
+        print(f"[+] Report generated: {report_file}")
     
-    def run_all(self):
-        """Run the complete reconnaissance process with improved progress tracking"""
+    async def run_all(self):
+        """Run the complete reconnaissance process"""
         start_time = time.time()
-        console.print(Panel.fit(
-            f"Starting comprehensive reconnaissance for {self.target}\n"
-            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            title="ReconMaster",
-            border_style="cyan"
-        ))
-        
-        # Execute all recon steps
-        steps = [
-            ("Passive Subdomain Enumeration", self.passive_subdomain_enum),
-            ("Active Subdomain Enumeration", self.active_subdomain_enum),
-            ("Resolving Live Domains", self.resolve_live_domains),
-            ("Taking Screenshots", self.take_screenshots),
-            ("Scanning for Takeovers", self.scan_for_takeovers),
-            ("Crawling Endpoints", self.crawl_endpoints),
-            ("Directory Brute Forcing", self.directory_bruteforce),
-            ("Finding Parameters", self.find_parameters),
-            ("Checking Broken Links", self.check_broken_links),
-            ("Port Scanning", self.port_scan),
-            ("Generating Report", self.generate_report)
-        ]
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task("Overall Progress", total=len(steps))
-            
-            for name, step in steps:
-                progress.update(task, description=f"Running {name}...")
-                step()
-                progress.update(task, advance=1)
-        
+        print(f"Starting comprehensive reconnaissance for {self.target} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+        # Execute all recon steps with await
+        await self.passive_subdomain_enum()
+        await self.active_subdomain_enum()
+        await self.resolve_live_domains()
+        await self.take_screenshots()
+        await self.scan_for_takeovers()
+        await self.crawl_endpoints()
+        await self.directory_bruteforce()
+        await self.find_parameters()
+        await self.check_broken_links()
+        await self.port_scan()
+        await self.generate_report()
+    
         end_time = time.time()
         duration = end_time - start_time
-        
-        console.print(Panel.fit(
-            f"Reconnaissance completed in {duration:.2f} seconds\n"
-            f"Results saved to: {self.output_dir}",
-            title="ReconMaster",
-            border_style="green"
-        ))
-
+    
+        print(f"\n[+] Reconnaissance completed in {duration:.2f} seconds")
+        print(f"[+] Results saved to: {self.output_dir}")
 
 def main():
     parser = argparse.ArgumentParser(description="ReconMaster: Automated Reconnaissance Framework")
     parser.add_argument("-d", "--domain", required=True, help="Target domain to scan")
     parser.add_argument("-o", "--output", default="./recon_results", help="Output directory for results")
-    parser.add_argument("-t", "--threads", type=int, help="Number of threads to use")
+    parser.add_argument("-t", "--threads", type=int, default=10, help="Number of threads to use")
     parser.add_argument("-w", "--wordlist", help="Custom wordlist for subdomain brute forcing")
     parser.add_argument("--passive-only", action="store_true", help="Only perform passive reconnaissance")
-    parser.add_argument("--config", help="Path to custom configuration file")
-    parser.add_argument("--proxy", help="Proxy URL (e.g., http://127.0.0.1:8080)")
-    parser.add_argument("--timeout", type=int, help="Timeout for requests in seconds")
     
     args = parser.parse_args()
     
-    # Validate domain
-    if not args.domain:
-        console.print("[red][!] Target domain is required[/red]")
-        sys.exit(1)
-    
-    # Create ReconMaster instance
     recon = ReconMaster(
         target=args.domain,
         output_dir=args.output,
@@ -753,31 +758,19 @@ def main():
         wordlist=args.wordlist
     )
     
-    # Override config if specified
-    if args.config:
-        recon.config.config_file = Path(args.config)
-        recon.config.config = recon.config._load_config()
-    
-    # Override proxy if specified
-    if args.proxy:
-        recon.proxy = {
-            'enabled': True,
-            'http': args.proxy,
-            'https': args.proxy
-        }
-        os.environ['HTTP_PROXY'] = args.proxy
-        os.environ['HTTPS_PROXY'] = args.proxy
-    
-    # Override timeout if specified
-    if args.timeout:
-        recon.config.config['timeout'] = args.timeout
+    # Create and run async loop
+    loop = asyncio.get_event_loop()
     
     if args.passive_only:
-        recon.passive_subdomain_enum()
-        recon.resolve_live_domains()
-        recon.take_screenshots()
+        # Run passive recon tasks
+        loop.run_until_complete(asyncio.gather(
+            recon.passive_subdomain_enum(),
+            recon.resolve_live_domains(),
+            recon.take_screenshots()
+        ))
     else:
-        recon.run_all()
+        # Run the full async function
+        loop.run_until_complete(recon.run_all())
 
 
 if __name__ == "__main__":
